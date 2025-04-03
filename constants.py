@@ -6,10 +6,19 @@ CONSUMPTION = "consumption"
 # anchors
 TO_CUE_ON = "to_cue_on"
 TO_CUE_OFF = "to_cue_off"
-TO_CONSUMPTION = "to_consumption"
+TO_DECISION = "to_decision"
+
+anchored_periods = {
+    TO_CUE_ON: [BACKGROUND],
+    TO_CUE_OFF: [BACKGROUND, WAIT],
+    TO_DECISION: [WAIT, CONSUMPTION]
+}
+
+periods = [BACKGROUND, WAIT, CONSUMPTION]
 
 # sorters
-TIME_WAITED = 'time_waited'
-REWARD_TIME_WAITED = "reward_time_waited"
+REWARD_WAIT_LENGTH = ["missed", "rewarded", "wait_length"]
 BACKGROUND_LENGTH = "background_length"
+WAIT_LENGTH = "wait_length"
 TRIAL_NUM = "trial_num"
+WAIT_LENGTH = 'wait_length'
