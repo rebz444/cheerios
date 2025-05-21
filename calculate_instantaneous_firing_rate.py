@@ -44,7 +44,7 @@ def generate_time_frame(trials, time_step, trial_count_mask=1):
         
     return bin_edges, bin_centers, active_trials
 
-def calculate_firing_rates(trials, spikes, anchor, time_step, trial_count_mask=5, sigma=0.01):
+def calculate_firing_rates(trials, spikes, anchor, time_step, trial_count_mask, sigma=None, normalize_by=None):
     bin_edges, bin_centers, active_trials = generate_time_frame(trials, time_step, trial_count_mask)
     
     # Handle case where no bins meet criteria
@@ -61,8 +61,12 @@ def calculate_firing_rates(trials, spikes, anchor, time_step, trial_count_mask=5
     mean_fr = np.nansum(rates, axis=0) / active_trials
     sem_fr = np.std(rates, axis=0) / np.sqrt(active_trials)
 
-    if sigma > 0:
+    if sigma and sigma > 0:
         mean_fr = gaussian_filter1d(mean_fr, sigma=sigma)
         sem_fr = gaussian_filter1d(sem_fr, sigma=sigma)
+
+    if normalize_by:
+        mean_fr = mean_fr/normalize_by
+        sem_fr = sem_fr/normalize_by
 
     return bin_centers, mean_fr, sem_fr
