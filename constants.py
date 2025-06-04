@@ -1,3 +1,8 @@
+import numpy as np
+
+from matplotlib.colors import ListedColormap
+import matplotlib.pyplot as plt
+
 # periods
 BACKGROUND = "background"
 WAIT = "wait"
@@ -17,7 +22,8 @@ ANCHORED_PERIODS = {
 }
 
 # sorters
-TRIAL_NUM = "trial_num"
+TRIAL_NUM = "trial_id"
 BACKGROUND_LENGTH = "background_length"
 WAIT_LENGTH = "wait_length"
 REWARD_WAIT_LENGTH = ["missed", "rewarded", "wait_length"]
+
