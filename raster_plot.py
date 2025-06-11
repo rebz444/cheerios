@@ -15,7 +15,7 @@ def prepare_data_for_raster(events, trials, spikes, sorter):
     spikes_raster = spikes.groupby('trial_id')
     return events_raster, spikes_raster, sorted_trial_id
 
-def plot_raster(ax, events, trials, spikes, anchor, sorter, full_trial=False, show_legend=True):
+def plot_raster(ax, events, trials, spikes, anchor, sorter, show_legend=True):
     events_raster, spikes_raster, sorted_trial_id = prepare_data_for_raster(events, trials, spikes, sorter)
 
     ax.axvline(0, color='tab:gray', linestyle='--', alpha=0.5, label=anchor)
@@ -55,13 +55,6 @@ def plot_raster(ax, events, trials, spikes, anchor, sorter, full_trial=False, sh
 
     # Set y and x limits
     ax.set_ylim(-0.5, len(sorted_trial_id) - 0.5)
-    # if not full_trial:
-    #     if anchor == k.TO_CUE_ON:
-    #         ax.set_xlim(-0.2, 10)
-    #     elif anchor == k.TO_CUE_OFF:
-    #         ax.set_xlim(-8, 6)
-    #     elif anchor == k.TO_DECISION:
-    #         ax.set_xlim(-10, 3)
 
     # Create legend only for the last raster plot
     if show_legend:
