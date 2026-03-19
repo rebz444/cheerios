@@ -25,5 +25,6 @@ ANCHORED_PERIODS = {
 TRIAL_NUM = "trial_id"
 BACKGROUND_LENGTH = "background_length"
 WAIT_LENGTH = "wait_length"
+BACKGROUND_WAIT_LENGTH = "background_wait_length"
 REWARD_WAIT_LENGTH = ["missed", "rewarded", "wait_length"]
 

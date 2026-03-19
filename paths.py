@@ -1,6 +1,7 @@
 from pathlib import Path
 
-ONE_DRIVE_DIR = Path('/Users/rebekahzhang/OneDrive - JohnsHopkins/neural_data_analysis/')
+# ONE_DRIVE_DIR = Path('/Users/rebekahzhang/OneDrive - JohnsHopkins/neural_data_analysis/')
+ONE_DRIVE_DIR = Path('/Users/rebekahzhang/Library/CloudStorage/OneDrive-JohnsHopkins/neural_data_analysis/')
 DATA_DIR = Path('/Users/rebekahzhang/data/neural_data')
 
 LOGS_DIR = DATA_DIR / 'logs'
