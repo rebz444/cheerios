@@ -24,16 +24,17 @@ def plot_raster(ax, events, trials, spikes, anchor, sorter, show_legend=True):
         # Plot spikes first
         if t in spikes_raster.groups:
             trial_spikes = spikes_raster.get_group(t)
+            period_col = k.ANCHOR_PERIOD_COL[anchor]
             relevant_periods = k.ANCHORED_PERIODS[anchor]
-            relevant_spike_times = trial_spikes.loc[trial_spikes.period.isin(relevant_periods), anchor]
+            relevant_spike_times = trial_spikes.loc[trial_spikes[period_col].isin(relevant_periods), anchor]
             ax.eventplot(
-                relevant_spike_times, 
-                lineoffsets=trial_offset, 
-                color='k', 
-                linelengths=0.8, 
+                relevant_spike_times,
+                lineoffsets=trial_offset,
+                color='k',
+                linelengths=0.8,
                 linewidths=0.4
             )
-            irrelevant_spike_times = trial_spikes.loc[~trial_spikes.period.isin(relevant_periods), anchor]
+            irrelevant_spike_times = trial_spikes.loc[~trial_spikes[period_col].isin(relevant_periods), anchor]
             ax.eventplot(
                 irrelevant_spike_times, 
                 lineoffsets=trial_offset, 

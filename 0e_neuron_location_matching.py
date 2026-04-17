@@ -1,0 +1,691 @@
+"""
+neuron_location_matching.py
+===========================
+Assigns brain region labels to sorted units using histological probe tracks.
+
+Mapping method: trace-tip anchored with DV tissue shrinkage correction.
+  peak_ch_fixed = peak_channel_depth * DV_SCALE[mouse]  (in-vivo → fixed tissue)
+  dist          = trace_max − peak_ch_fixed              (distance from surface in fixed tissue)
+
+DV scale factors derived from brainreg log files (fusion z-slices * voxel_um / CCF DV 8000 um):
+  Batch voxel: z=10.0 um, xy=10.24 um, orientation=ipr, atlas=allen_mouse_10um (all except RZ034)
+  RZ034 voxel: z=9.2 um (different acquisition), orientation=ial
+
+Inputs:
+  RZ_unit_properties_with_qc.csv  — unit properties + QC pass/fail flags (output of 0d)
+
+Outputs:
+  RZ_unit_properties_with_qc_and_regions.csv  — unit properties + QC flags + region assignments
+"""
+
+import re
+import shutil
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.patches import Patch
+
+import paths as p
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+TRACKS_ROOT       = Path("/Volumes/T7 Shield/brain_stitching")
+LOCAL_TRACKS_DIR  = p.DATA_DIR / "probe_tracks"
+PLOT_DIR          = p.DATA_DIR / "location_matching"
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── DV tissue shrinkage scale factors (fixed tissue / in-vivo) ─────────────────
+# Computed from: (fusion_z_slices * voxel_um_z) / CCF_DV_8000um
+# Lower value = more shrinkage. Mean = 0.840 ± 0.026 (cf. IBL ~0.86).
+DV_SCALE = {
+    "RZ034": 0.904,   # 786 slices * 9.2 um / 8000 um  (different acquisition)
+    "RZ036": 0.843,   # 674 slices * 10.0 um / 8000 um
+    "RZ037": 0.821,   # 657 slices * 10.0 um / 8000 um
+    "RZ038": 0.886,   # 709 slices * 10.0 um / 8000 um
+    "RZ039": 0.873,   # 698 slices * 10.0 um / 8000 um
+    "RZ047": 0.826,   # 661 slices * 10.0 um / 8000 um
+    "RZ049": 0.859,   # 687 slices * 10.0 um / 8000 um
+    "RZ050": 0.848,   # 678 slices * 10.0 um / 8000 um
+    "RZ051": 0.804,   # 643 slices * 10.0 um / 8000 um
+    "RZ052": 0.802,   # 642 slices * 10.0 um / 8000 um  *** LOW CONFIDENCE ***
+    "RZ053": 0.840,   # 672 slices * 10.0 um / 8000 um
+}
+
+CLEARING_PROBLEMATIC_MICE = set(
+    # used to ignore mice for analysis
+    # "RZ052",
+    # "RZ034",
+)
+
+# ── Google Sheet — recording log ───────────────────────────────────────────────
+_RECORDING_LOG_SHEET_ID = "1xpb52EO7BII-_5zIcB2HaOpZqepFcYTvBYgxA4zLyNo"
+RECORDING_LOG_URL = (
+    f"https://docs.google.com/spreadsheets/d/{_RECORDING_LOG_SHEET_ID}"
+    "/export?format=csv&gid=0"
+)
+
+# Consistency check: flag sessions where |track_length - insertion_depth| / insertion_depth
+# exceeds this fraction. 25% ≈ IBL 2-sigma upper bound for tissue shrinkage.
+CONSISTENCY_THRESHOLD_PCT = 0.25
+
+
+# ── Helper functions ───────────────────────────────────────────────────────────
+
+def parse_depth(val):
+    """Parse insertion depth from recording log (handles 'all', 'can't tell', etc.)."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return None
+    s = str(val).strip().lower()
+    if s in ("all", "can't tell", "cant tell", ""):
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    return float(m.group(1)) if m else None
+
+
+def flip_hemisphere(h):
+    """Recording log stores the hemisphere the probe is in; track file is on
+    the opposite side (probe crosses midline and the dye tract is on that side)."""
+    return "r" if str(h).strip().lower() == "l" else "l"
+
+
+def build_track_name(hemisphere, region):
+    return f"{flip_hemisphere(hemisphere)}_{str(region).strip().lower()}"
+
+
+def copy_tracks_from_ssd():
+    """Copy all track CSVs from SSD to local neural data dir. Overwrites to get latest files."""
+    if not TRACKS_ROOT.exists():
+        print(f"Warning: SSD not found at {TRACKS_ROOT}. Using existing local tracks.")
+        return
+    LOCAL_TRACKS_DIR.mkdir(parents=True, exist_ok=True)
+    for mouse_dir in TRACKS_ROOT.iterdir():
+        if not mouse_dir.is_dir():
+            continue
+        src_tracks = mouse_dir / "brainreg_output" / "segmentation" / "sample_space" / "tracks"
+        if not src_tracks.exists():
+            continue
+        dst_tracks = LOCAL_TRACKS_DIR / mouse_dir.name / "brainreg_output" / "segmentation" / "sample_space" / "tracks"
+        dst_tracks.mkdir(parents=True, exist_ok=True)
+        for csv_file in src_tracks.glob("*.csv"):
+            shutil.copy2(csv_file, dst_tracks / csv_file.name)
+    print(f"Tracks copied to {LOCAL_TRACKS_DIR}")
+
+
+def find_track_csv(mouse, track_name):
+    base = LOCAL_TRACKS_DIR / mouse / "brainreg_output" / "segmentation" / "sample_space" / "tracks"
+    candidate = base / f"{track_name}.csv"
+    if candidate.exists():
+        return candidate
+    for path in base.glob("*.csv"):
+        if track_name in path.stem:
+            return path
+    return None
+
+
+def load_track_csv(path):
+    df = pd.read_csv(path)
+    df.columns = [c.strip() for c in df.columns]
+    dist_col = [c for c in df.columns if "distance" in c.lower() or "dist" in c.lower()]
+    if not dist_col:
+        raise ValueError(f"No distance column in {path}. Columns: {list(df.columns)}")
+    return df.rename(columns={dist_col[0]: "dist_um"}).sort_values("dist_um").reset_index(drop=True)
+
+
+def lookup_region(track_df, dist_um):
+    """Return (acronym, full_name) for a given distance along the track (fixed tissue µm)."""
+    if np.isnan(dist_um):
+        return ("nan_depth", "NaN depth")
+    max_dist = track_df["dist_um"].max()
+    min_dist = track_df["dist_um"].min()
+    if dist_um < min_dist - 50:
+        return ("above_surface", "Above brain surface")
+    if dist_um > max_dist + 50:
+        return ("below_track", "Below tracked region")
+    idx = (track_df["dist_um"] - dist_um).abs().idxmin()
+    row = track_df.iloc[idx]
+    acronym   = str(row.get("Region acronym", row.get("region_acronym", "unknown")))
+    full_name = str(row.get("Region name",    row.get("region_name",    "unknown")))
+    return (acronym, full_name)
+
+
+# ── 1. Load data ───────────────────────────────────────────────────────────────
+print("Loading unit properties and recording log...")
+up_df = pd.read_csv(p.LOGS_DIR / "RZ_unit_properties_with_qc.csv")
+# Columns already renamed by 0d (mouse, id, datetime); rename only if originals still present
+if "subject" in up_df.columns:
+    up_df = up_df.rename(columns={"subject": "mouse", "unit": "id", "session_datetime": "datetime"})
+up_df["date_only"] = pd.to_datetime(up_df["datetime"]).dt.strftime("%Y-%m-%d")
+
+log = pd.read_csv(RECORDING_LOG_URL)
+log["date_only"] = pd.to_datetime(log["date"]).dt.strftime("%Y-%m-%d")
+log["depth_um"]  = log["depth"].apply(parse_depth)
+
+print(f"  Units : {len(up_df):,} rows (all mice)")
+print(f"  Log   : {len(log):,} rows")
+
+copy_tracks_from_ssd()
+
+# ── 2. Build session lookup and run consistency check ─────────────────────────
+
+# Mice with tracks: scan LOCAL_TRACKS_DIR for any mouse that has at least one track CSV
+mice_with_tracks = set()
+if LOCAL_TRACKS_DIR.exists():
+    for mouse_dir in LOCAL_TRACKS_DIR.iterdir():
+        if not mouse_dir.is_dir():
+            continue
+        tracks_subdir = mouse_dir / "brainreg_output" / "segmentation" / "sample_space" / "tracks"
+        if tracks_subdir.exists() and any(tracks_subdir.glob("*.csv")):
+            mice_with_tracks.add(mouse_dir.name)
+
+print(f"\nMice with tracks ({len(mice_with_tracks)}): {sorted(mice_with_tracks)}")
+
+all_mice = set(log["mouse"].unique())
+mice_awaiting_histology = all_mice - mice_with_tracks
+print(f"Mice awaiting histology ({len(mice_awaiting_histology)}): {sorted(mice_awaiting_histology)}")
+
+# Filter units and sessions to only mice with histology done
+up_df = up_df[up_df["mouse"].isin(mice_with_tracks)].copy()
+print(f"  Units (histology done): {len(up_df):,} rows")
+
+print("\nBuilding session lookup and checking track / insertion depth consistency...")
+
+session_info = log[log["mouse"].isin(mice_with_tracks)][
+    ["mouse", "date_only", "insertion_number", "region", "hemisphere", "depth_um"]
+].copy()
+session_info["track_file"] = session_info.apply(
+    lambda r: build_track_name(r["hemisphere"], r["region"]), axis=1
+)
+
+rows = []
+consistency_results = {}   # key: (mouse, date_only, insertion_number)
+
+for _, row in session_info.iterrows():
+    key        = (row["mouse"], row["date_only"], int(row["insertion_number"]))
+    ins_depth  = row["depth_um"]
+    track_name = row["track_file"]
+    track_path = find_track_csv(row["mouse"], track_name)
+
+    scale = DV_SCALE.get(row["mouse"], 1.0)
+
+    if track_path is None:
+        status, track_len, diff, diff_corrected, ins_depth_fixed = (
+            f"NO TRACK FILE: {track_name}.csv", None, None, None, None
+        )
+    elif ins_depth is None:
+        track_df       = load_track_csv(track_path)
+        track_len      = track_df["dist_um"].max()
+        diff           = None
+        diff_corrected = None
+        ins_depth_fixed = None
+        status         = "depth unknown in log"
+    else:
+        track_df        = load_track_csv(track_path)
+        track_len       = track_df["dist_um"].max()
+        ins_depth_fixed = ins_depth * scale
+        diff            = track_len - ins_depth
+        diff_corrected  = track_len - ins_depth_fixed
+        frac_diff       = abs(diff_corrected) / ins_depth_fixed
+        status          = "ok" if frac_diff <= CONSISTENCY_THRESHOLD_PCT \
+                          else f"WARNING: {abs(diff_corrected):.0f} µm off ({frac_diff*100:.1f}%)"
+
+    consistency_results[key] = dict(
+        track_path=track_path, track_length_um=track_len,
+        insertion_depth=ins_depth, consistency=status
+    )
+    rows.append(dict(
+        mouse=row["mouse"], date=row["date_only"],
+        insertion=int(row["insertion_number"]), track_file=track_name,
+        insertion_depth_um=ins_depth, insertion_depth_fixed_um=ins_depth_fixed,
+        track_length_um=track_len,
+        diff_um=diff, diff_corrected_um=diff_corrected, status=status
+    ))
+
+consistency_df = pd.DataFrame(rows)
+n_warn = consistency_df["status"].str.contains("WARNING|NO TRACK", na=False).sum()
+n_ok   = len(consistency_df) - n_warn
+print(f"  Sessions checked: {len(consistency_df)}  |  OK: {n_ok}  |  Flagged: {n_warn}")
+
+# Sessions from mice with histology done but no track file found for that insertion
+no_track = consistency_df[consistency_df["status"].str.contains("NO TRACK", na=False)]
+if len(no_track):
+    print(f"\n  Missing track files (mouse has histology but track CSV not found):")
+    print(no_track[["mouse", "date", "insertion", "track_file", "status"]].to_string(index=False))
+
+# Show flagged sessions
+warned = consistency_df[consistency_df["status"].str.contains("WARNING", na=False)]
+if len(warned):
+    unit_counts = (
+        up_df.groupby(["mouse", "date_only", "insertion_number"])
+        .size()
+        .reset_index(name="n_units")
+        .rename(columns={"date_only": "date", "insertion_number": "insertion"})
+    )
+    warned = warned.merge(unit_counts, on=["mouse", "date", "insertion"], how="left")
+    warned["n_units"] = warned["n_units"].fillna(0).astype(int)
+    print(f"\n  Track and insertion depth mismatch sessions:")
+    print(warned[["mouse", "date", "track_file",
+                  "insertion_depth_um", "insertion_depth_fixed_um", "track_length_um",
+                  "diff_um", "diff_corrected_um", "n_units", "status"]].to_string(index=False))
+
+
+# ── 3. QC plot: track length vs insertion depth ────────────────────────────────
+processed = consistency_df[
+    ~consistency_df["status"].str.contains("NO TRACK", na=False) &
+    ~consistency_df["mouse"].isin(CLEARING_PROBLEMATIC_MICE)
+].copy()
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+_diff_cols = [
+    ("diff_um",           "track length − insertion depth (raw, µm)"),
+    ("diff_corrected_um", "track length − DV-corrected depth (µm)"),
+]
+for row_axes, (diff_col, xlabel) in zip(axes, _diff_cols):
+    for ax, region in zip(row_axes, ["str", "v1"]):
+        mask = processed["track_file"].str.startswith(
+            ("l_" + region, "r_" + region), na=False
+        )
+        data = processed.loc[mask, diff_col].dropna()
+        ax.hist(data, bins=20, edgecolor="white", linewidth=0.5)
+        ax.axvline(0, color="red", linestyle="--", linewidth=1)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Session count")
+        ax.set_title(region.upper())
+        median_str = f"{data.median():.0f}" if len(data) else "n/a"
+        ax.text(0.98, 0.97, f"n={len(data)}\nmedian={median_str} µm",
+                transform=ax.transAxes, ha="right", va="top", fontsize=9)
+plt.suptitle("Track length − insertion depth (top: raw  |  bottom: DV-corrected)", y=1.01)
+plt.tight_layout()
+plt.savefig(PLOT_DIR / "qc_track_vs_insertion.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+
+# ── 4. Map units to brain regions ─────────────────────────────────────────────
+# Method: trace-tip anchored with DV shrinkage correction.
+#   peak_ch_fixed = peak_channel_depth * DV_SCALE[mouse]
+#   dist          = trace_max − peak_ch_fixed
+# Both dist and track dist_um are in fixed-tissue space.
+# Surface noise units (peak_ch > trace_max after scaling) are marked above_surface.
+
+print("\nCaching track files...")
+track_cache = {}
+for info in consistency_results.values():
+    if info["track_path"] is not None and info["track_path"] not in track_cache:
+        track_cache[info["track_path"]] = load_track_csv(info["track_path"])
+
+print("Mapping units to brain regions (trace-tip anchored, DV-scale corrected)...")
+
+units_merged = up_df.merge(
+    session_info[["mouse", "date_only", "insertion_number",
+                  "region", "hemisphere", "depth_um", "track_file"]],
+    on=["mouse", "date_only", "insertion_number"],
+    how="left"
+)
+
+region_acronyms = []
+region_names    = []
+dist_along_track = []
+consistency_col  = []
+track_file_col   = []
+depth_confidence = []
+
+for _, row in units_merged.iterrows():
+    key  = (row["mouse"], row["date_only"], int(row["insertion_number"]))
+    info = consistency_results.get(key)
+
+    if info is None:
+        region_acronyms.append("no_session_match")
+        region_names.append("No session match")
+        dist_along_track.append(np.nan)
+        consistency_col.append("no match")
+        track_file_col.append(None)
+        depth_confidence.append("no match")
+        continue
+
+    peak_d = row["peak_channel_depth"]
+    mouse  = row["mouse"]
+
+    if isinstance(peak_d, float) and np.isnan(peak_d):
+        region_acronyms.append("unknown_depth")
+        region_names.append("Depth unknown")
+        dist_along_track.append(np.nan)
+        consistency_col.append(info["consistency"])
+        track_file_col.append(str(row.get("track_file", "")))
+        depth_confidence.append("unknown")
+        continue
+
+    if info["track_path"] is None:
+        region_acronyms.append("no_track_file")
+        region_names.append("Track file not found")
+        dist_along_track.append(np.nan)
+        consistency_col.append(info["consistency"])
+        track_file_col.append(str(row.get("track_file", "")))
+        depth_confidence.append("no track")
+        continue
+
+    tdf       = track_cache[info["track_path"]]
+    trace_max = tdf["dist_um"].max()
+
+    # Convert peak_channel_depth from in-vivo to fixed tissue space
+    scale         = DV_SCALE.get(mouse, 1.0)
+    peak_d_fixed  = peak_d * scale
+    dist          = trace_max - peak_d_fixed
+
+    acronym, full_name = lookup_region(tdf, dist)
+    region_acronyms.append(acronym)
+    region_names.append(full_name)
+    dist_along_track.append(dist)
+    consistency_col.append(info["consistency"])
+    track_file_col.append(str(row.get("track_file", "")))
+
+    # Confidence tier
+    if mouse in CLEARING_PROBLEMATIC_MICE:
+        conf = "low"
+    elif "WARNING" in str(info["consistency"]):
+        conf = "low"
+    elif acronym == "above_surface":
+        conf = "above_surface"
+    elif acronym in ("below_track", "no_track_file"):
+        conf = "below_track"
+    else:
+        conf = "ok"
+    depth_confidence.append(conf)
+
+up_df["region_acronym"]      = region_acronyms
+up_df["region_name"]         = region_names
+up_df["dist_along_track_um"] = dist_along_track
+up_df["track_file"]          = track_file_col
+up_df["depth_consistency"]   = consistency_col
+up_df["depth_confidence"]    = depth_confidence
+
+print(f"  Done mapping {len(up_df):,} units")
+print(f"\n  Depth confidence breakdown:")
+print(up_df["depth_confidence"].value_counts().to_string())
+
+
+# ── 5. Filter to placeable units ───────────────────────────────────────────────
+# Keep units where:
+#   - depth_consistency == "ok"  (track/insertion within threshold)
+#   - region is not a sentinel value (above_surface is noise, below_track unplaced)
+#   - above_surface excluded: confirmed surface noise via quality metrics
+#     (amplitude -71 uV vs -167 uV, max_drift 0.43 vs 3.20, SNR 6.3 vs 13.8)
+
+EXCLUDE_REGIONS = {"above_surface", "below_track", "no_track_file",
+                   "no_session_match", "unknown_depth", "nan_depth"}
+
+up_df_all = up_df.copy()   # keep full df for reference
+
+up_df = up_df[
+    (up_df["depth_consistency"] == "ok") &
+    (~up_df["region_acronym"].isin(EXCLUDE_REGIONS))
+].reset_index(drop=True)
+
+print(f"\n  Units after filtering:")
+print(f"    Total mapped     : {len(up_df_all):,}")
+print(f"    depth_consistency ok: {(up_df_all['depth_consistency']=='ok').sum():,}")
+print(f"    above_surface excluded: {(up_df_all['region_acronym']=='above_surface').sum():,}"
+      f"  (surface noise confirmed by quality metrics)")
+print(f"    below_track excluded : {(up_df_all['region_acronym']=='below_track').sum():,}")
+print(f"    Final clean units    : {len(up_df):,}")
+
+
+# ── 6. QC plots ───────────────────────────────────────────────────────────────
+# Compute probe_region here so it's available for all downstream plots
+up_df["probe_region"] = up_df["track_file"].apply(
+    lambda t: "str" if "_str" in str(t) else ("v1" if "_v1" in str(t) else "other")
+)
+
+region_palette = {"str": "#2ca02c", "v1": "#9467bd", "other": "#7f7f7f"}
+
+col = "peak_channel_depth"
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+for row_axes, probe in zip(axes, ["str", "v1"]):
+    subset = up_df[up_df["probe_region"] == probe][col].dropna()
+    stats  = subset.describe()
+    row_axes[0].hist(subset, bins=40, color=region_palette[probe],
+                     edgecolor="white", linewidth=0.5, alpha=0.85)
+    row_axes[0].set_xlabel("Peak channel depth (µm from probe tip, in-vivo)")
+    row_axes[0].set_ylabel("Unit count")
+    row_axes[0].set_title(f"{probe.upper()} — distribution of peak channel depth")
+    row_axes[0].text(0.98, 0.97,
+                     f"n={int(stats['count'])}\nmedian={stats['50%']:.0f}\nstd={stats['std']:.0f}",
+                     transform=row_axes[0].transAxes, ha="right", va="top", fontsize=9)
+    sns.ecdfplot(x=subset, ax=row_axes[1], color=region_palette[probe])
+    row_axes[1].set_xlabel("Peak channel depth (µm from probe tip, in-vivo)")
+    row_axes[1].set_ylabel("Cumulative fraction")
+    row_axes[1].set_title(f"{probe.upper()} — CDF of peak channel depth")
+plt.suptitle("Peak channel depth by probe type (STR top, V1 bottom)", fontsize=11)
+plt.tight_layout()
+plt.savefig(PLOT_DIR / "qc_peak_channel_depth.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+
+# ── 7. Summary plots ──────────────────────────────────────────────────────────
+
+# ── Plot 1: DV shrinkage per animal ───────────────────────────────────────────
+shrink_pct = {m: (1 - s) * 100 for m, s in DV_SCALE.items()}
+mice_sorted = sorted(shrink_pct, key=shrink_pct.get)
+pcts        = [shrink_pct[m] for m in mice_sorted]
+colors      = ["#d62728" if m in CLEARING_PROBLEMATIC_MICE else "#1f77b4" for m in mice_sorted]
+
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.axvspan(4, 24, color="gray", alpha=0.15, label="IBL 2σ band (4–24%)")
+ax.axvline(14, color="gray", linestyle="--", linewidth=1, label="IBL median (14%)")
+bars = ax.barh(mice_sorted, pcts, color=colors, edgecolor="white", linewidth=0.5)
+ax.set_xlabel("DV shrinkage (%)")
+ax.set_title("DV tissue shrinkage per animal")
+
+legend_elements = [
+    Patch(facecolor="#1f77b4", label="Used"),
+    Patch(facecolor="#d62728", label=f"Excluded ({', '.join(sorted(CLEARING_PROBLEMATIC_MICE))})"),
+    Patch(facecolor="gray", alpha=0.3, label="IBL 2σ band (4–24%)"),
+]
+ax.legend(handles=legend_elements, fontsize=8)
+ax.set_xlim(0, max(pcts) * 1.15)
+for bar, val in zip(bars, pcts):
+    ax.text(val + 0.3, bar.get_y() + bar.get_height() / 2,
+            f"{val:.1f}%", va="center", fontsize=8)
+plt.tight_layout()
+plt.savefig(PLOT_DIR / "summary_shrinkage_per_animal.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+
+# ── Plot 2: Track length vs insertion depth scatter ───────────────────────────
+# Note: processed already excludes CLEARING_PROBLEMATIC_MICE
+scatter_data = processed[processed["insertion_depth_um"].notna() &
+                         processed["track_length_um"].notna()].copy()
+scatter_data["probe_region"] = scatter_data["track_file"].apply(
+    lambda t: "str" if "_str" in str(t) else ("v1" if "_v1" in str(t) else "other")
+)
+
+_scatter_panels = [
+    ("insertion_depth_um",       "Insertion depth (µm, raw)",            "Track length vs. insertion depth (raw)"),
+    ("insertion_depth_fixed_um", "Insertion depth (µm, DV-corrected)",   "Track length vs. insertion depth (DV-corrected)"),
+]
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+for ax, (x_col, xlabel, title) in zip(axes, _scatter_panels):
+    _sd = scatter_data[scatter_data[x_col].notna()]
+    depth_min = _sd[x_col].min() * 0.85
+    depth_max = max(_sd[x_col].max(), _sd["track_length_um"].max()) * 1.1
+    ref = np.array([depth_min, depth_max])
+    ax.fill_between(ref, ref * 0.75, ref * 1.25, color="gray", alpha=0.12,
+                    label="±25% threshold")
+    ax.plot(ref, ref, "k--", linewidth=1, label="y = x")
+    for region, grp in _sd.groupby("probe_region"):
+        ax.scatter(grp[x_col], grp["track_length_um"],
+                   color=region_palette.get(region, "gray"),
+                   label=region, alpha=0.75, s=40, edgecolors="white", linewidths=0.4)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Track length (µm, from CSV)")
+    ax.set_title(title)
+    ax.set_xlim(depth_min, depth_max)
+    ax.set_ylim(depth_min, depth_max)
+    ax.set_aspect("equal")
+    ax.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(PLOT_DIR / "summary_track_vs_insertion_scatter.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+
+# ── Plot 3: Quality metric comparison (above_surface vs in-brain) ─────────────
+_METRIC_CANDIDATES = {
+    "Amplitude (µV)": ["amplitude", "amplitude_uv", "mean_amplitude"],
+    "SNR":            ["snr", "signal_to_noise", "amplitude_cutoff"],
+    "Max drift (µm)": ["max_drift", "drift_ptp", "drift"],
+    "Firing rate (Hz)":["firing_rate", "fr", "mean_firing_rate"],
+}
+
+above_s = up_df_all[up_df_all["region_acronym"] == "above_surface"]
+in_brain = up_df_all[
+    up_df_all["track_file"].isin(above_s["track_file"].unique()) &
+    ~up_df_all["region_acronym"].isin(EXCLUDE_REGIONS)
+]
+
+found_metrics = {}
+for label, candidates in _METRIC_CANDIDATES.items():
+    for col in candidates:
+        if col in up_df_all.columns:
+            found_metrics[label] = col
+            break
+
+if found_metrics:
+    n_metrics = len(found_metrics)
+    fig, axes = plt.subplots(1, n_metrics, figsize=(3 * n_metrics, 4))
+    if n_metrics == 1:
+        axes = [axes]
+    for ax, (label, col) in zip(axes, found_metrics.items()):
+        vals_above  = above_s[col].dropna()
+        vals_inbrain = in_brain[col].dropna()
+        ax.boxplot([vals_above, vals_inbrain],
+                   tick_labels=[f"above\nsurface\n(n={len(vals_above)})",
+                                f"in-brain\n(n={len(vals_inbrain)})"],
+                   widths=0.5, patch_artist=True,
+                   boxprops=dict(facecolor="none"),
+                   medianprops=dict(color="black", linewidth=2))
+        ax.set_title(label, fontsize=9)
+        ax.tick_params(axis="x", labelsize=8)
+    plt.suptitle("Quality metrics: above-surface vs in-brain units\n(same probes)",
+                 fontsize=10)
+    plt.tight_layout()
+    plt.savefig(PLOT_DIR / "summary_quality_above_vs_inbrain.png",
+                dpi=150, bbox_inches="tight")
+    plt.close()
+else:
+    print("  [Plot 3 skipped — no quality metric columns found in data]")
+
+
+# ── Plot 4: Units per brain region ────────────────────────────────────────────
+_STR_REGIONS  = {"CP", "GPe", "GPi", "STR", "PAL", "SI", "LSX", "STRd", "STRv",
+                 "ACB", "OT", "CEA", "LA", "BLA", "EP", "MEA"}
+_V1_REGIONS   = {"VISp", "VISp1", "VISp2/3", "VISp4", "VISp5", "VISp6a", "VISp6b",
+                 "VISl", "VISrl", "VISal", "VISam", "VISpm", "VISli",
+                 "VISpl", "VISpor", "VIS"}
+_THAL_REGIONS = {"VAL", "LD", "LP", "CL", "RT", "VPL", "VPM", "PO", "MD", "AV",
+                 "AM", "IAD", "RE", "VM", "CM", "Eth", "TH", "SGN", "MG", "LGd",
+                 "LGv", "LGN", "ILM", "RN", "PIL", "SPF", "PP", "VENT", "ATN"}
+
+def _region_color(acronym):
+    a = str(acronym)
+    if a in _STR_REGIONS or any(a.startswith(r) for r in ("CP", "GP", "STR", "PAL")):
+        return "#2ca02c"   # green  = striatum targets
+    if a in _V1_REGIONS or a.startswith("VIS"):
+        return "#9467bd"   # purple = visual cortex targets
+    if a in _THAL_REGIONS:
+        return "#ff7f0e"   # orange = thalamus
+    return "#aec7e8"       # light blue = other
+
+legend_patches = [
+    Patch(facecolor="#2ca02c", label="Striatum targets (CP, GPe, PAL…)"),
+    Patch(facecolor="#9467bd", label="Visual cortex targets (VISp, VISl…)"),
+    Patch(facecolor="#ff7f0e", label="Thalamus (VAL, LP, CL…)"),
+    Patch(facecolor="#aec7e8", label="Other"),
+]
+
+_probe_subsets = [
+    ("str", "STR probes"),
+    ("v1",  "V1 probes"),
+]
+_counts_by_probe = {
+    probe: up_df[up_df["probe_region"] == probe]["region_acronym"].value_counts()
+    for probe, _ in _probe_subsets
+}
+max_rows = max(len(c) for c in _counts_by_probe.values()) if _counts_by_probe else 4
+
+fig, axes = plt.subplots(1, 2, figsize=(14, max(4, max_rows * 0.35)))
+for ax, (probe, probe_label) in zip(axes, _probe_subsets):
+    rc = _counts_by_probe[probe]
+    rc = rc[rc > 0].sort_values()
+    colors = [_region_color(r) for r in rc.index]
+    ax.barh(rc.index, rc.values, color=colors, edgecolor="white", linewidth=0.4)
+    ax.set_xlabel("Unit count")
+    ax.set_title(f"Units per region — {probe_label}  (n={rc.sum():,})")
+    for i, (name, val) in enumerate(zip(rc.index, rc.values)):
+        ax.text(val + 0.5, i, str(val), va="center", fontsize=7)
+    ax.legend(handles=legend_patches, fontsize=8, loc="lower right")
+plt.suptitle("Units per brain region by probe location", fontsize=11)
+plt.tight_layout()
+plt.savefig(PLOT_DIR / "summary_units_per_region.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+
+# ── 8. Region counts and save ─────────────────────────────────────────────────
+print("\nRegion counts (clean units):")
+print(up_df["region_acronym"].value_counts().to_string())
+
+out_path = p.LOGS_DIR / "RZ_unit_properties_with_qc_and_regions.csv"
+up_df.to_csv(out_path, index=False)
+print(f"\nSaved {len(up_df):,} units → {out_path}")
+
+
+# ── 9. STR+CP unit counts per session (STR probes only) ──────────────────────
+str_sessions = up_df[up_df["probe_region"] == "str"]
+
+total_units = (
+    str_sessions
+    .groupby(["mouse", "date_only"])
+    .size()
+    .reset_index(name="n_total_units")
+)
+
+str_cp_units = (
+    str_sessions[str_sessions["region_acronym"].isin(_STR_REGIONS)]
+    .groupby(["mouse", "date_only"])
+    .size()
+    .reset_index(name="n_str_cp_units")
+)
+
+str_session_summary = (
+    total_units
+    .merge(str_cp_units, on=["mouse", "date_only"], how="left")
+    .fillna({"n_str_cp_units": 0})
+    .assign(n_str_cp_units=lambda d: d["n_str_cp_units"].astype(int))
+    .sort_values("n_str_cp_units", ascending=False)
+    .reset_index(drop=True)
+)
+
+print(f"\nAll STR probe sessions — total units and STR+CP units (sorted by STR+CP high→low):")
+print(str_session_summary.to_string(index=False))
+print(f"\n  Sessions : {len(str_session_summary)}")
+print(f"  Total units   : {str_session_summary['n_total_units'].sum():,}")
+print(f"  STR+CP units  : {str_session_summary['n_str_cp_units'].sum():,}")
+
+# Dominant region per mouse (STR probes) for early cohort
+_EARLY_MICE = ["RZ034", "RZ036", "RZ037", "RZ038", "RZ039"]
+dominant = (
+    str_sessions[str_sessions["mouse"].isin(_EARLY_MICE)]
+    .groupby(["mouse", "region_acronym"])
+    .size()
+    .reset_index(name="n")
+    .sort_values("n", ascending=False)
+    .groupby("mouse")
+    .first()
+    .reset_index()
+    .rename(columns={"region_acronym": "dominant_region"})
+    [["mouse", "dominant_region", "n"]]
+)
+print(f"\nDominant region for STR probes (RZ034–RZ039):")
+print(dominant.to_string(index=False))
