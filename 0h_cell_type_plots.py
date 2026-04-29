@@ -1,23 +1,24 @@
 """
 0h_cell_type_plots.py
 ======================
-Generate diagnostic plots for committee meeting after running 0g_cell_type_relabeling_v2.py
+Diagnostic plots for cell type relabeling output (0g_cell_type_relabeling.py).
 
 Plots:
-  1. Units per region BEFORE correction (aggregated + detailed)
-  2. Units per region AFTER correction (aggregated + detailed)
+  1. Units per region BEFORE vs AFTER correction (aggregated)
+  2. Units per region AFTER correction (detailed top 20)
   3. Cell type counts by probe type
   4. Cell type × region cross-tabulation heatmap
-  5. Waveforms by cell type (mean ± SD)
+  5. FR × PT scatter colored by cell type
   6. Cortex-STR boundary validation (depth distributions)
-  7. FR × PT scatter colored by cell type
-  8. Per-animal breakdown
+  7. Per-animal breakdown
+  8. Mean waveforms by cell type (± 1 SD)
+  9. PT and FR 1D marginal distributions by cell type
 
 Inputs:
-  RZ_unit_properties_final.csv (output of 0g_v2)
-  RZ_unit_templates.npz (for waveforms)
+  RZ_unit_properties_final.csv  (output of 0g_cell_type_relabeling.py)
+  RZ_unit_templates.npz         (for waveform plots)
 
-Outputs → DATA_DIR/location_matching/cell_type_v2/
+Outputs → DATA_DIR/location_matching/cell_type/
 """
 
 import numpy as np
@@ -27,19 +28,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import seaborn as sns
-from pathlib import Path
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-class Paths:
-    DATA_DIR = Path("./data")
-    LOGS_DIR = Path("./logs")
+import paths as p
 
-try:
-    import paths as p
-except ImportError:
-    p = Paths()
-
-PLOT_DIR = p.DATA_DIR / "location_matching" / "cell_type_v2"
+PLOT_DIR = p.DATA_DIR / "location_matching" / "cell_type"
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Region sets (same as 0g_v2) ───────────────────────────────────────────────
@@ -104,7 +96,7 @@ print("=" * 70)
 
 csv_path = p.LOGS_DIR / "RZ_unit_properties_final.csv"
 if not csv_path.exists():
-    raise FileNotFoundError(f"Run 0g_cell_type_relabeling_v2.py first. Missing: {csv_path}")
+    raise FileNotFoundError(f"Run 0g_cell_type_relabeling.py first. Missing: {csv_path}")
 
 print(f"\nLoading: {csv_path.name}")
 df = pd.read_csv(csv_path)
@@ -115,7 +107,7 @@ print(f"  {n_total:,} units")
 required_cols = ["corrected_region", "cell_type", "region_acronym", "probe_region"]
 for col in required_cols:
     if col not in df.columns:
-        raise ValueError(f"Missing column: {col}. Run 0g_cell_type_relabeling_v2.py first.")
+        raise ValueError(f"Missing column: {col}. Run 0g_cell_type_relabeling.py first.")
 
 # Add region groups if not present
 if "region_group" not in df.columns:
@@ -511,6 +503,67 @@ else:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PLOT 9: 1D PT and FR distributions by cell type (density histograms)
+# ══════════════════════════════════════════════════════════════════════════════
+# Complements Plot 5 (joint scatter) by showing each marginal cleanly.
+if fr_col and "pt_duration_ms" in df.columns:
+    print("\n[Plot 9] PT and FR 1D distributions by cell type...")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+    # MSN drawn last (and slightly more opaque) so it reads on top
+    ct_order_overlay = ["ambiguous", "high_FR", "TAN", "RS", "FSI", "MSN"]
+
+    # Panel A — PT duration
+    ax = axes[0]
+    for ct in ct_order_overlay:
+        mask = df["cell_type"] == ct
+        if mask.sum() < 5:
+            continue
+        pt_vals = df.loc[mask, "pt_duration_ms"].dropna()
+        ax.hist(pt_vals, bins=40, range=(0.1, 0.9),
+                color=CELL_TYPE_COLORS.get(ct, "#888"),
+                alpha=0.85 if ct == "MSN" else 0.6,
+                label=f"{ct} (n={len(pt_vals)})",
+                density=True, linewidth=0.5, edgecolor="white")
+    ax.axvline(0.35, color="gray", linestyle="--", linewidth=1.2, alpha=0.7, label="0.35 ms (FSI)")
+    ax.axvline(0.40, color="black", linestyle="--", linewidth=1.2, alpha=0.7, label="0.40 ms (MSN)")
+    ax.set_xlabel("PT duration (ms)")
+    ax.set_ylabel("Density")
+    ax.set_title("PT Duration Distribution by Cell Type")
+    ax.legend(fontsize=7, loc="upper left")
+    ax.grid(True, alpha=0.15)
+
+    # Panel B — Firing rate (log-scale)
+    ax = axes[1]
+    fr_bins = np.logspace(np.log10(0.05), np.log10(200), 45)
+    for ct in ct_order_overlay:
+        mask = df["cell_type"] == ct
+        if mask.sum() < 5:
+            continue
+        fr_vals = df.loc[mask, fr_col].dropna()
+        fr_vals = fr_vals[fr_vals > 0]
+        ax.hist(fr_vals, bins=fr_bins,
+                color=CELL_TYPE_COLORS.get(ct, "#888"),
+                alpha=0.85 if ct == "MSN" else 0.6,
+                label=f"{ct} (n={len(fr_vals)})",
+                density=True, linewidth=0.5, edgecolor="white")
+    ax.axvline(15, color="black", linestyle="--", linewidth=1.2, alpha=0.7, label="15 Hz (MSN)")
+    ax.set_xscale("log")
+    ax.set_xlabel("Firing rate (Hz)")
+    ax.set_ylabel("Density")
+    ax.set_title("Firing Rate Distribution by Cell Type")
+    ax.legend(fontsize=7, loc="upper right")
+    ax.grid(True, alpha=0.15)
+
+    fig.suptitle("Marginal Distributions by Cell Type", fontsize=14, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(PLOT_DIR / "9_pt_fr_distributions.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved -> 9_pt_fr_distributions.png")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
@@ -520,13 +573,14 @@ print(f"\nOutput directory: {PLOT_DIR}")
 print(f"\nGenerated plots:")
 for i, name in enumerate([
     "region_counts_aggregated",
-    "region_counts_detailed", 
+    "region_counts_detailed",
     "cell_type_counts",
     "region_celltype_heatmap",
     "fr_pt_scatter",
     "depth_distributions",
     "per_animal",
     "waveforms_by_celltype",
+    "pt_fr_distributions",
 ], start=1):
     fpath = PLOT_DIR / f"{i}_{name}.png"
     status = "✓" if fpath.exists() else "✗"

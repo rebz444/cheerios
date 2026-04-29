@@ -1,9 +1,9 @@
 """
 DMS rescaling plots.
 
-Loads the results cache saved by str_rescaling_analysis_fixed.py and
-regenerates all figures. Edit plotting functions here and re-run without
-re-running the slow analysis step.
+Loads the results cache saved by str_rescaling_analysis.py and regenerates
+all figures. Edit plotting functions here and re-run without re-running the
+slow analysis step.
 
 Usage:
     python str_rescaling_plots.py
@@ -17,7 +17,7 @@ import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
 import pandas as pd
 
-from str_rescaling_analysis_fixed import (
+from str_rescaling_analysis import (
     build_population_matrix, compute_pair_r,
     QUARTILE_LABELS, N_BINS_NORM, N_SHUFFLE, TIME_STEP, SIGMA,
     T_MAX_SHORT, T_MAX_LONG, MIN_TRIALS,
