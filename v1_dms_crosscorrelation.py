@@ -10,7 +10,7 @@ Analysis:
      A session is simultaneous only if the recording log marks BOTH the V1 and
      STR insertions as simultaneous on the same date.
   2. Filter V1 units to visual-cortex neurons (RZ_v1_cortical.csv, waveform-verified).
-     Filter STR units to MSNs (RZ_str_msn.csv, output of 0g_cell_type_relabeling).
+     Filter STR units to MSNs (RZ_str_msn.csv, output of 0h_cell_type_relabeling).
   3. Compute jitter-corrected spike cross-correlograms for all V1-MSN unit pairs.
   4. Test for V1-lead latency (~5-15 ms expected for monosynaptic corticostriatal).
 
@@ -46,13 +46,13 @@ OUT_DIR = p.DATA_DIR / 'v1_dms_crosscorrelation'
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Unit metadata CSVs ────────────────────────────────────────────────────────
-# NOTE: RZ_v1_cortical.csv is a stale artifact from the old 0g_v1 run; current 0g
+# NOTE: RZ_v1_cortical.csv is a stale artifact from the old 0g_v1 run; current 0h
 # does not regenerate it. The current `RZ_cortex_units.csv` is NOT a safe substitute
 # (it mixes V1 probe + STR probe shallow including thalamus/hippocampus). Either
 # re-create the V1-cortex-only filter from RZ_unit_properties_final.csv, or extend
-# 0g to output a proper RZ_v1_cortical.csv. Until then this path will go stale.
+# 0h to output a proper RZ_v1_cortical.csv. Until then this path will go stale.
 V1_CSV  = p.LOGS_DIR / 'RZ_v1_cortical.csv'   # ⚠ stale — see note above
-MSN_CSV = p.LOGS_DIR / 'RZ_str_msn.csv'       # output of 0g_cell_type_relabeling
+MSN_CSV = p.LOGS_DIR / 'RZ_str_msn.csv'       # output of 0h_cell_type_relabeling
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

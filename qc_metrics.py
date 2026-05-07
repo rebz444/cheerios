@@ -185,7 +185,21 @@ mouse_summary = (
       )
       .reset_index()
 )
-mouse_summary["histology_done"] = mouse_summary["mouse"].isin(c.ALL_ANIMALS)
+def _mice_with_tracks():
+    """Mice with at least one probe-track CSV in p.DATA_DIR / 'probe_tracks'."""
+    found = set()
+    tracks_dir = p.DATA_DIR / "probe_tracks"
+    if not tracks_dir.exists():
+        return found
+    for mouse_dir in tracks_dir.iterdir():
+        if not mouse_dir.is_dir():
+            continue
+        sub = mouse_dir / "brainreg_output" / "segmentation" / "sample_space" / "tracks"
+        if sub.exists() and any(sub.glob("*.csv")):
+            found.add(mouse_dir.name)
+    return found
+
+mouse_summary["histology_done"] = mouse_summary["mouse"].isin(_mice_with_tracks())
 
 def get_cohort(mouse):
     for cohort, members in c.COHORT_DICT.items():

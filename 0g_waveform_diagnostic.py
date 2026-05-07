@@ -1,11 +1,11 @@
 """
-0f_waveform_diagnostic.py
+0g_waveform_diagnostic.py
 =========================
 Combined waveform visualisation and FR/PT biological-prior validation.
 Replaces 0f_waveform_by_region.py and 0g_waveform_fr_validation.py.
 
 Requires:
-  LOGS_DIR / RZ_unit_properties_with_qc_and_regions.csv  (output of 0e)
+  LOGS_DIR / RZ_unit_properties_with_qc_and_regions.csv  (output of 0f)
   LOGS_DIR / RZ_unit_templates.npz
 
 Section 1 — Waveform by region
@@ -34,7 +34,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.patches import Patch
 
 import paths as p
-from constants import REGION_COLORS, EARLY_COHORT, LATER_COHORT, ALL_ANIMALS
+from constants import REGION_COLORS
 from utils import load_waveform_metrics
 
 # ── Output directory ───────────────────────────────────────────────────────────
@@ -53,12 +53,47 @@ WAVEFORM_REGIONS = [
 # Validation plots include all regions with defined priors
 VALIDATION_REGIONS = [
     "CP", "GPe",
-    "MOp5", "MOp2/3", "MOp1",
-    "VISp5", "VISp2/3", "VISp4",
-    "VAL", "AV", "CL",
+    "MOp5", "MOp2/3", "MOp1", "MOp6a",
+    "VISp5", "VISp2/3", "VISp4", "VISp6a", "VISp6b",
+    "VAL", "AV", "CL", "PO", "VPM", "LD",
     "RT",
     "CA1", "SUB",
+    "PAL",          # pallidum — borders CP, recorded on STR probes, priors defined
 ]
+
+# Probe-context expectations: which probe types should we expect units from for
+# each region? "_str" probes target striatum and pass through cortex/thalamus on
+# the way; "_v1" probes target visual cortex. Units appearing on the wrong probe
+# are not necessarily wrong — but they're worth flagging in the cross-check.
+EXPECTED_PROBE_CONTEXT = {
+    "CP":      {"str"},
+    "GPe":     {"str"},
+    "GPi":     {"str"},
+    "PAL":     {"str"},
+    "MOp5":    {"str"},   # STR probe enters via MOp
+    "MOp2/3":  {"str"},
+    "MOp1":    {"str"},
+    "MOp6a":   {"str"},
+    "VISp5":   {"v1"},
+    "VISp2/3": {"v1"},
+    "VISp4":   {"v1"},
+    "VISp1":   {"v1"},
+    "VISp6a":  {"v1"},
+    "VISp6b":  {"v1"},
+    "VISl1":   {"v1"},
+    "VISl2/3": {"v1"},
+    # Thalamic relays sit between cortex and CP — STR probes pass through them.
+    "VAL":     {"str"},
+    "AV":      {"str"},
+    "CL":      {"str"},
+    "LD":      {"str"},
+    "LP":      {"str", "v1"},
+    "PO":      {"str", "v1"},
+    "VPM":     {"str"},
+    "RT":      {"str"},
+    "CA1":     {"v1"},   # V1 probe overshoots into HPC
+    "SUB":     {"v1"},
+}
 
 # ── Biological priors ──────────────────────────────────────────────────────────
 # Format: (pt_min_ms, pt_max_ms, fr_min_hz, fr_max_hz)
@@ -96,6 +131,8 @@ REGION_PRIORS = {
     "CL":      (0.30, None,  2.0,  40.0),
     "LD":      (0.35, None,  2.0,  30.0),
     "LP":      (0.35, None,  2.0,  30.0),
+    "PO":      (0.35, None,  2.0,  35.0),   # posterior thalamic relay (Sherman 2007)
+    "VPM":     (0.35, None,  2.0,  35.0),   # ventral posteromedial relay (Steriade 1993)
     "RT":      (None, 0.35,  5.0,  80.0),   # NARROW mandatory
     "CA1":     (0.35, None,  0.5,  10.0),
     "SUB":     (0.35, None,  0.5,  15.0),
@@ -107,7 +144,7 @@ REGION_PRIORS = {
 # Load data (once)
 # ══════════════════════════════════════════════════════════════════════════════
 print("=" * 60)
-print("0f_waveform_diagnostic.py")
+print("0g_waveform_diagnostic.py")
 print("=" * 60)
 
 _csv_candidates = [
@@ -126,6 +163,15 @@ regions_df["datetime"]         = pd.to_datetime(regions_df["datetime"])
 regions_df["insertion_number"] = regions_df["insertion_number"].astype(int)
 regions_df["id"]               = regions_df["id"].astype(int)
 regions_df["paramset_idx"]     = regions_df["paramset_idx"].astype(int)
+
+# Strip any waveform columns left behind by 0f's boundary-recovery step;
+# load_waveform_metrics re-computes them and a duplicate template_idx would
+# collide on its merge.
+_STALE_WF_COLS = ["template_idx", "pt_duration_ms", "trough_amp_uv",
+                  "peak_amp_uv", "pt_ratio"]
+regions_df = regions_df.drop(
+    columns=[c for c in _STALE_WF_COLS if c in regions_df.columns]
+)
 print(f"  {len(regions_df):,} units loaded")
 
 # ── Detect firing rate column ──────────────────────────────────────────────────
@@ -394,9 +440,34 @@ with pd.option_context("display.float_format", "{:.2f}".format,
                        "fr_median", "pct_bio_ok"]].to_string())
 
 print("\nNotes:")
-print("  RT: 0% narrow waveforms — strong evidence of misassignment")
 print("  GPe: check fr_median is >20 Hz — if not, probe is still in STR/cortex")
 print("  CP: fr_median should be <5 Hz for MSN-dominated recordings")
+
+# ── CP failure mode breakdown ──────────────────────────────────────────────────
+# SPNs are ~90–95% of striatal neurons anatomically, but in recordings ~75–85%
+# of units are classified as putative MSNs because FSIs (~1–2% anatomically)
+# have high FR and large amplitude and are overrepresented. A rate below ~65%
+# suggests edge/boundary recording. Failure modes:
+#   Fail PT only → narrow waveform → FSI or fast-spiking contaminant
+#   Fail FR only → fast but broad   → TAN (cholinergic), ChAT+, or misassignment
+#   Fail both    → narrow + fast    → genuine interneuron or noise
+#   Pass both    → broad + low FR   → putative MSN candidate for 0h
+if "CP" in merged["region_acronym"].values and HAS_FR:
+    cp = merged[merged["region_acronym"] == "CP"].copy()
+    n_cp   = len(cp)
+    n_fail_pt_only = int(((cp["pt_ok"] == False) & (cp["fr_ok"] == True)).sum())
+    n_fail_fr_only = int(((cp["pt_ok"] == True)  & (cp["fr_ok"] == False)).sum())
+    n_fail_both    = int(((cp["pt_ok"] == False)  & (cp["fr_ok"] == False)).sum())
+    n_pass_both    = int(((cp["pt_ok"] == True)   & (cp["fr_ok"] == True)).sum())
+    # Strict MSN gate: Reinhold 2025 (halfwidth → PT proxy) + low FR
+    n_msn_strict = int(((cp["pt_duration_ms"] >= 0.40) & (cp[fr_col] < 4.0)).sum())
+    print(f"\n── CP failure breakdown (n={n_cp}) ──")
+    print(f"  Fail PT only  (narrow → FSI-like)     : {n_fail_pt_only:3d}  ({n_fail_pt_only/n_cp*100:.1f}%)")
+    print(f"  Fail FR only  (fast+broad → TAN/ChAT?): {n_fail_fr_only:3d}  ({n_fail_fr_only/n_cp*100:.1f}%)")
+    print(f"  Fail both     (narrow+fast → noise?)  : {n_fail_both:3d}  ({n_fail_both/n_cp*100:.1f}%)")
+    print(f"  Pass both     (broad+low FR → MSN-like): {n_pass_both:3d}  ({n_pass_both/n_cp*100:.1f}%)")
+    print(f"  Strict MSN gate (PT≥0.40ms, FR<4Hz)   : {n_msn_strict:3d}  ({n_msn_strict/n_cp*100:.1f}%)")
+    print(f"  Expected ~75–85% putative MSNs in a well-targeted STR recording.")
 
 
 # ── [Plot 4] FR × PT scatter ──────────────────────────────────────────────────
@@ -519,7 +590,7 @@ else:
 # ── [Plot 5] Per-animal bio-consistency heatmap ───────────────────────────────
 print("\n[Plot 5] Per-animal heatmap...")
 
-heatmap_animals = [m for m in ALL_ANIMALS if m in merged["mouse"].values]
+heatmap_animals = sorted(merged["mouse"].unique())
 heatmap_regions = [r for r in avail_val if r in REGION_PRIORS]
 
 heatmap_pct = np.full((len(heatmap_animals), len(heatmap_regions)), np.nan)
@@ -557,11 +628,6 @@ for i in range(len(heatmap_animals)):
                     ha="center", va="center", fontsize=7.5,
                     fontweight="bold", color=txt_color)
 
-if EARLY_COHORT and LATER_COHORT:
-    n_early = len([m for m in EARLY_COHORT if m in heatmap_animals])
-    if 0 < n_early < len(heatmap_animals):
-        ax.axhline(n_early - 0.5, color="white", linewidth=2.5)
-
 ax.set_xticks(range(len(heatmap_regions)))
 ax.set_xticklabels(heatmap_regions, rotation=45, ha="right", fontsize=9)
 ax.set_yticks(range(len(heatmap_animals)))
@@ -570,7 +636,7 @@ plt.colorbar(im, ax=ax, fraction=0.025, pad=0.01).set_label(
     "% bio-consistent units", fontsize=9)
 ax.set_title(
     "Bio-consistency by animal × region\n"
-    "(% units passing FR + PT priors | white line = early vs later cohort)",
+    "(% units passing FR + PT priors)",
     fontsize=12)
 fig.tight_layout()
 fig.savefig(PLOT_DIR / "per_animal_consistency_heatmap.png",
@@ -736,23 +802,159 @@ if len(flagged) > 0:
     print("  Saved → flagged_unit_waveforms.png")
 
 
-# ── Export flagged unit list ───────────────────────────────────────────────────
+# ── Probe-context cross-check ──────────────────────────────────────────────────
+# For each region with units, report the mix of probe types those units came
+# from. Units appearing on a probe outside EXPECTED_PROBE_CONTEXT are flagged.
+print("\n── Probe-context cross-check ──")
+if "probe_region" in merged.columns:
+    ctx_rows = []
+    for region, expected in EXPECTED_PROBE_CONTEXT.items():
+        sub = merged[merged["region_acronym"] == region]
+        if not len(sub):
+            continue
+        counts = sub["probe_region"].value_counts().to_dict()
+        unexpected = {p: n for p, n in counts.items() if p not in expected}
+        ctx_rows.append({
+            "region": region,
+            "expected_probes": "/".join(sorted(expected)),
+            "n_total": len(sub),
+            "by_probe": ", ".join(f"{p}={n}" for p, n in counts.items()),
+            "n_unexpected": int(sum(unexpected.values())),
+        })
+    ctx_df = pd.DataFrame(ctx_rows).sort_values("n_unexpected", ascending=False)
+    print(ctx_df.to_string(index=False))
+    ctx_df.to_csv(PLOT_DIR / "probe_context_check.csv", index=False)
+    print(f"  Saved → probe_context_check.csv")
+else:
+    print("  probe_region column missing — skipping cross-check.")
+
+
+# ── ccb boundary units ────────────────────────────────────────────────────────
+# ccb (corpus callosum body) has no neuronal cell bodies, but units labelled
+# ccb here are genuine recordings. They arise from two sources:
+#   1. Daily CSF-mediated position variability — brain is suspended in spinal
+#      fluid, so small day-to-day shifts in probe landing position occur even
+#      when targeting the same depth. A single blended histological track cannot
+#      capture this. Units near the CP/ccb or cortex/ccb border may be assigned
+#      to ccb on any given session.
+#   2. Atlas registration error — the Allen CCF ccb boundary doesn't perfectly
+#      match every individual brain. A ≤200 µm atlas offset shifts real CP or
+#      cortical neurons across the ccb label.
+# 0f does NO boundary recovery — all ccb units from the atlas assignment are
+# present here. 0h will use the nearest-region information saved below to
+# recover units near CP or cortex using waveform + location criteria.
+print(f"\n── ccb boundary units ──")
+ccb_units = merged[merged["region_acronym"] == "ccb"].copy()
+print(f"  ccb units (raw atlas assignment): {len(ccb_units)}")
+if len(ccb_units):
+    n_narrow_ccb = int((ccb_units["pt_duration_ms"] < 0.35).sum())
+    n_broad_ccb  = int((ccb_units["pt_duration_ms"] >= 0.40).sum())
+    n_mid_ccb    = len(ccb_units) - n_narrow_ccb - n_broad_ccb
+    n_msn_like_ccb = (
+        int(((ccb_units["pt_duration_ms"] >= 0.40) & (ccb_units[fr_col] < 4.0)).sum())
+        if HAS_FR else "n/a"
+    )
+    print(f"  Waveform profile:")
+    print(f"    Narrow (PT < 0.35ms, FSI/cortical-FS-like): {n_narrow_ccb}")
+    print(f"    Mid    (PT 0.35–0.40ms, ambiguous)         : {n_mid_ccb}")
+    print(f"    Broad  (PT ≥ 0.40ms, MSN/pyramidal-like)   : {n_broad_ccb}")
+    if HAS_FR:
+        print(f"    Strict MSN-like (PT≥0.40ms, FR<4Hz)        : {n_msn_like_ccb}")
+    print(f"  By mouse:")
+    print(ccb_units.groupby("mouse").size().rename("n_ccb").to_string())
+
+    # Find nearest non-ccb neighbour on the same track to infer likely origin.
+    # The nearest_region and gap_um columns are consumed by 0h's recovery rules.
+    if "track_file" in ccb_units.columns and "dist_along_track_um" in ccb_units.columns:
+        neighbor_rows = []
+        for _, u in ccb_units.iterrows():
+            track = u.get("track_file")
+            dist  = u.get("dist_along_track_um", np.nan)
+            same_track = merged[
+                (merged["track_file"] == track) &
+                (~merged["region_acronym"].isin({"ccb"})) &
+                merged["dist_along_track_um"].notna()
+            ] if not pd.isna(dist) else pd.DataFrame()
+            if len(same_track):
+                gaps        = (same_track["dist_along_track_um"] - dist).abs()
+                nearest     = same_track.loc[gaps.idxmin()]
+                gap_um      = round(float(gaps.min()), 0)
+                near_region = nearest["region_acronym"]
+            else:
+                near_region, gap_um = "none", np.nan
+            row = {
+                # Unit keys needed by 0h for merge
+                "mouse":            u["mouse"],
+                "datetime":         u.get("datetime"),
+                "insertion_number": u.get("insertion_number"),
+                "paramset_idx":     u.get("paramset_idx"),
+                "id":               u.get("id"),
+                # Location
+                "probe_region":     u.get("probe_region"),
+                "dist_along_track_um": round(dist, 0) if not np.isnan(dist) else np.nan,
+                "pt_duration_ms":   round(u["pt_duration_ms"], 3),
+                # Nearest-region info for recovery rules
+                "nearest_region":   near_region,
+                "gap_um":           gap_um,
+            }
+            if HAS_FR:
+                row[fr_col] = round(u[fr_col], 2)
+            neighbor_rows.append(row)
+        nb_df = pd.DataFrame(neighbor_rows)
+        print(f"\n  Nearest non-ccb region on same track:")
+        print(nb_df.to_string(index=False))
+        print(f"\n  Nearest-region breakdown:")
+        print(nb_df["nearest_region"].value_counts().to_string())
+        nb_df.to_csv(PLOT_DIR / "ccb_boundary_units.csv", index=False)
+    else:
+        # Fallback: save unit keys only (no neighbor info)
+        ccb_export_cols = ["mouse", "datetime", "insertion_number", "paramset_idx", "id",
+                           "region_acronym", "depth_confidence", "probe_region",
+                           "dist_along_track_um", "pt_duration_ms"]
+        if HAS_FR:
+            ccb_export_cols.append(fr_col)
+        ccb_units[
+            [c for c in ccb_export_cols if c in ccb_units.columns]
+        ].sort_values(["mouse", "datetime"]).to_csv(PLOT_DIR / "ccb_boundary_units.csv", index=False)
+    print(f"  Saved → ccb_boundary_units.csv")
+
+
+# ── Export flagged unit list (split: GPe boundary candidates vs others) ───────
 print("\nExporting flagged unit list...")
 JOIN_KEYS = ["mouse", "datetime", "insertion_number", "paramset_idx", "id"]
 export_cols = (
     JOIN_KEYS +
-    ["region_acronym", "region_name", "depth_confidence",
+    ["region_acronym", "region_name", "depth_confidence", "probe_region",
      "pt_duration_ms", "trough_amp_uv",
      "pt_ok", "fr_ok", "bio_consistent"]
 )
 if HAS_FR:
     export_cols.insert(export_cols.index("pt_duration_ms"), fr_col)
 
-flagged_export = merged[merged["bio_consistent"] == False][
+flagged_all = merged[merged["bio_consistent"] == False][
     [c for c in export_cols if c in merged.columns]
-].sort_values(["region_acronym", "mouse"])
-flagged_export.to_csv(PLOT_DIR / "flagged_units.csv", index=False)
-print(f"  Saved {len(flagged_export):,} flagged units → flagged_units.csv")
+].copy()
+
+# GPe units flagged here are typically broad+slow → MSN-like → boundary
+# candidates. They warrant their own file because the action is different
+# (re-examine the CP/GPe boundary, not "drop the unit").
+GPE_REGIONS = {"GPe", "GPi", "GP"}
+gpe_boundary_mask = (
+    flagged_all["region_acronym"].isin(GPE_REGIONS)
+    & (flagged_all["pt_duration_ms"] >= 0.40)
+)
+if HAS_FR:
+    gpe_boundary_mask &= (flagged_all[fr_col] <= 15.0)
+
+gpe_boundary_export = flagged_all[gpe_boundary_mask].sort_values(["mouse", "datetime"])
+flagged_other       = flagged_all[~gpe_boundary_mask].sort_values(["region_acronym", "mouse"])
+
+flagged_other.to_csv(PLOT_DIR / "flagged_units.csv", index=False)
+print(f"  Saved {len(flagged_other):,} flagged units (excl. GPe boundary) → flagged_units.csv")
+
+gpe_boundary_export.to_csv(PLOT_DIR / "flagged_units_gpe_boundary.csv", index=False)
+print(f"  Saved {len(gpe_boundary_export):,} GPe → CP boundary candidates "
+      f"→ flagged_units_gpe_boundary.csv")
 
 
 # ── Final summary ──────────────────────────────────────────────────────────────
@@ -776,11 +978,95 @@ for _, row in pass_df.iterrows():
         flag = "Acceptable"
     print(f"  {row['region']:12s}  {pct:5.1f}%  {flag}")
 
+
+# ── RT broad-waveform boundary check ──────────────────────────────────────────
+# RT (reticular thalamus) requires narrow waveforms (PT < 0.35 ms) — it is
+# entirely GABAergic fast-spiking. Any RT unit with PT ≥ 0.35 ms fails the
+# prior and is a candidate misassignment: atlas boundary error can place a
+# CP-edge or VAL-edge neuron into RT. We check whether these units sit within
+# 300 µm of the CP depth range on their track, making reclassification plausible.
+print(f"\n── RT broad-waveform boundary check ──")
+rt_broad = merged[
+    (merged["region_acronym"] == "RT") &
+    (merged["pt_duration_ms"] >= 0.35)
+].copy()
+print(f"  RT units with PT ≥ 0.35 ms (violates narrow prior): {len(rt_broad)}")
+
+if len(rt_broad) and "dist_along_track_um" in merged.columns and "track_file" in merged.columns:
+    # Per-track CP depth range (from CP-assigned units on the same probe)
+    cp_depth_by_track = (
+        merged[merged["region_acronym"] == "CP"]
+        .groupby("track_file")["dist_along_track_um"]
+        .agg(cp_min="min", cp_max="max")
+    )
+
+    rows = []
+    for _, u in rt_broad.iterrows():
+        track = u.get("track_file")
+        dist  = u.get("dist_along_track_um", np.nan)
+        if track in cp_depth_by_track.index and not np.isnan(dist):
+            cp_min = cp_depth_by_track.loc[track, "cp_min"]
+            cp_max = cp_depth_by_track.loc[track, "cp_max"]
+            # Gap = 0 if unit is within the CP range, else distance to nearest edge
+            if dist < cp_min:
+                gap = cp_min - dist
+            elif dist > cp_max:
+                gap = dist - cp_max
+            else:
+                gap = 0.0
+            near_cp = gap <= 300
+            cp_range_str = f"{cp_min:.0f}–{cp_max:.0f}"
+        else:
+            cp_min = cp_max = gap = np.nan
+            near_cp = False
+            cp_range_str = "no CP on track"
+        row = {
+            # Unit keys needed by 0h for merge
+            "mouse":            u["mouse"],
+            "datetime":         u.get("datetime"),
+            "insertion_number": u.get("insertion_number"),
+            "paramset_idx":     u.get("paramset_idx"),
+            "id":               u.get("id"),
+            # Location
+            "track_file":       track,
+            "dist_along_track_um": round(dist, 0) if not np.isnan(dist) else np.nan,
+            "pt_duration_ms":   round(u["pt_duration_ms"], 3),
+            "cp_range_um":      cp_range_str,
+            "gap_to_cp_um":     round(gap, 0) if not np.isnan(gap) else np.nan,
+            "near_cp_300um":    near_cp,
+        }
+        if HAS_FR:
+            row[fr_col] = round(u[fr_col], 2)
+        rows.append(row)
+
+    rt_check_df = pd.DataFrame(rows)
+    n_near = int(rt_check_df["near_cp_300um"].sum())
+    n_no_cp = (rt_check_df["cp_range_um"] == "no CP on track").sum()
+    print(f"  Within 300 µm of CP on same track : {n_near}")
+    print(f"  No CP units on same track          : {n_no_cp}")
+    print(f"  Far from CP (>300 µm, likely thal.): {len(rt_broad) - n_near - n_no_cp}")
+
+    if n_near:
+        print(f"\n  Candidate CP-boundary misassignments (within 300 µm of CP):")
+        print(rt_check_df[rt_check_df["near_cp_300um"]].to_string(index=False))
+    not_near = rt_check_df[~rt_check_df["near_cp_300um"]]
+    if len(not_near):
+        print(f"\n  Far from CP or no CP on track (likely RT boundary / atlas edge):")
+        print(not_near.to_string(index=False))
+
+    rt_check_df.to_csv(PLOT_DIR / "rt_broad_boundary_check.csv", index=False)
+    print(f"  Saved → rt_broad_boundary_check.csv")
+elif len(rt_broad):
+    print("  dist_along_track_um or track_file column missing — skipping distance check.")
+
 print(f"\nOutputs saved to: {PLOT_DIR}")
 for fname in [
     "waveform_by_region.png", "waveform_metrics_scatter.png", "waveform_heatmap.png",
     "fr_pt_scatter_overview.png", "fr_pt_scatter_faceted.png",
     "per_animal_consistency_heatmap.png", "prior_range_strips.png",
-    "pass_rate_summary.png", "flagged_unit_waveforms.png", "flagged_units.csv",
+    "pass_rate_summary.png", "flagged_unit_waveforms.png",
+    "flagged_units.csv", "flagged_units_gpe_boundary.csv",
+    "ccb_boundary_units.csv", "rt_broad_boundary_check.csv",
+    "probe_context_check.csv",
 ]:
     print(f"  {fname}")

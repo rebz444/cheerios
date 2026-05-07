@@ -13,7 +13,7 @@ Method:
       scale_DV       = physical_DV_um / CCF_DV_8000um
   This formula is orientation-agnostic — input "ipr" and "ial" mice both work.
 
-The output CSV is the single source of truth consumed by 0e_neuron_location_matching.py.
+The output CSV is the single source of truth consumed by 0f_neuron_location_matching.py.
 
 Inputs:
   TRACKS_ROOT/<mouse>/brainreg_output/boundaries.tiff

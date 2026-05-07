@@ -3,8 +3,12 @@ population_decoder.py
 ─────────────────────
 Run the full population-clock decoder pipeline on every session that meets
 the inclusion thresholds:
-    • > MIN_UNITS  MSN units (from RZ_str_msn.csv)
+    • > MIN_UNITS  striatal units (cell types per CELL_TYPE_MODE)
     • > MIN_TRIALS valid (non-miss) trials
+
+The CELL_TYPE_MODE config selects which striatal cell types enter the
+population (MSN-only, all STR units, or MSN+FSI+TAN). Outputs are written
+to a mode-specific subdirectory so runs don't clobber each other.
 
 For each qualifying session the pipeline runs:
   1. Build population firing-rate matrices (Ridge regression)
@@ -43,12 +47,24 @@ import paths as p
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-OUT_DIR = p.DATA_DIR / 'population_decoding'
-MSN_CSV = p.LOGS_DIR / 'RZ_str_msn.csv'  # MSN units — output of 0g_cell_type_relabeling
+# Cell type mode — which striatal cell types enter the decoding population.
+# 'msn'         → MSNs only (projection neurons; primary analysis)
+# 'all_str'     → all QC-passing STR units regardless of cell type
+# 'msn_fsi_tan' → canonical striatal types (excludes RS/high_FR/ambiguous)
+CELL_TYPE_MODE = 'msn'
+
+CELL_TYPE_GROUPS = {
+    'msn'        : ['MSN'],
+    'all_str'    : ['MSN', 'FSI', 'TAN', 'high_FR', 'RS', 'ambiguous'],
+    'msn_fsi_tan': ['MSN', 'FSI', 'TAN'],
+}
+
+STR_UNITS_CSV = p.LOGS_DIR / 'RZ_str_units.csv'  # All STR units w/ cell_type — output of 0g
+OUT_DIR = p.DATA_DIR / 'population_decoding' / CELL_TYPE_MODE
 
 # Inclusion thresholds
 MIN_UNITS  = 15
-MIN_TRIALS = 150
+MIN_TRIALS = 90
 
 GROUP_DICT = {
     'Long BG' : c.GROUP_DICT['l'],
@@ -105,7 +121,8 @@ ANCHOR_COLORS = {
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def load_decoder_data(group_dict=None, unit_csv=None, msn_csv=None, pickle_dir=None):
+def load_decoder_data(group_dict=None, unit_csv=None, str_units_csv=None,
+                      cell_types=None, pickle_dir=None):
     """
     Build trials_df, spikes_df, units_df from per-session pickle files.
 
@@ -117,12 +134,15 @@ def load_decoder_data(group_dict=None, unit_csv=None, msn_csv=None, pickle_dir=N
     unit_csv : str or Path, optional
         Path to RZ_unit_properties_with_qc_and_regions.csv (output of 0e).
         If provided, only QC-passing CP/STR units are included; otherwise all
-        units are used. Ignored when msn_csv is provided.
-    msn_csv : str or Path, optional
-        Path to an MSN unit list CSV (e.g. RZ_str_msn.csv from 0g_cell_type_relabeling).
-        When provided, only units listed in this CSV are included — the CSV is
-        already pre-filtered by cell_type==MSN, so no additional region/QC
-        conditions are applied. Takes precedence over unit_csv.
+        units are used. Ignored when str_units_csv is provided.
+    str_units_csv : str or Path, optional
+        Path to RZ_str_units.csv (output of 0h_cell_type_relabeling) — all
+        units physically in striatum, with a `cell_type` column. Takes
+        precedence over unit_csv. Combine with `cell_types` to subset by
+        cell type. Filters by qc_pass_all when present.
+    cell_types : list of str, optional
+        Cell types to include when using str_units_csv (e.g. ['MSN'],
+        ['MSN', 'FSI', 'TAN']). If None, all cell types in the CSV are kept.
     pickle_dir : str or Path, optional
         Directory containing per-session .pkl files. Defaults to paths.PICKLE_DIR.
 
@@ -160,12 +180,14 @@ def load_decoder_data(group_dict=None, unit_csv=None, msn_csv=None, pickle_dir=N
             key = f"{row['mouse']}|{row['date']}|{int(row['insertion_number'])}"
             session_to_key[sid] = key
 
-    msn_df = None
-    if msn_csv is not None and os.path.exists(str(msn_csv)):
-        msn_df = pd.read_csv(msn_csv)
+    str_df = None
+    if str_units_csv is not None and os.path.exists(str(str_units_csv)):
+        str_df = pd.read_csv(str_units_csv)
+        if cell_types is not None:
+            str_df = str_df[str_df['cell_type'].isin(cell_types)].copy()
 
     qc_df = None
-    if msn_df is None and unit_csv is not None and os.path.exists(str(unit_csv)):
+    if str_df is None and unit_csv is not None and os.path.exists(str(unit_csv)):
         qc_df = pd.read_csv(unit_csv)
 
     all_trials, all_spikes, all_units = [], [], []
@@ -188,11 +210,11 @@ def load_decoder_data(group_dict=None, unit_csv=None, msn_csv=None, pickle_dir=N
         units_dict = sess['units']  # {unit_id: spikes_df}
 
         sess_key = session_to_key.get(session_id, '')
-        if msn_df is not None:
-            mask = msn_df['session_key'] == sess_key
-            if 'qc_pass_all' in msn_df.columns:
-                mask &= msn_df['qc_pass_all'] == True
-            good_uids = set(msn_df.loc[mask, 'id'].tolist())
+        if str_df is not None:
+            mask = str_df['session_key'] == sess_key
+            if 'qc_pass_all' in str_df.columns:
+                mask &= str_df['qc_pass_all'] == True
+            good_uids = set(str_df.loc[mask, 'id'].tolist())
             sample_key = next(iter(units_dict), None)
             if sample_key is not None and good_uids:
                 good_uids = {type(sample_key)(u) for u in good_uids}
@@ -266,7 +288,12 @@ def load_decoder_data(group_dict=None, unit_csv=None, msn_csv=None, pickle_dir=N
     units_df  = pd.DataFrame(all_units)
 
     n_sess = trials_df['session'].nunique() if not trials_df.empty else 0
-    unit_src = "MSN" if msn_df is not None else ("QC STR" if qc_df is not None else "all")
+    if str_df is not None:
+        unit_src = f"STR[{','.join(cell_types)}]" if cell_types else "STR[all]"
+    elif qc_df is not None:
+        unit_src = "QC STR"
+    else:
+        unit_src = "all"
     print(f"Loaded {n_sess} sessions | {len(units_df)} {unit_src} unit records | "
           f"{len(trials_df)} trials")
     return trials_df, spikes_df, units_df
@@ -2093,14 +2120,16 @@ if __name__ == '__main__':
 
     if PLOT_ONLY:
         # ── Skip analysis, regenerate summary plots from saved CSVs ──────────
-        print("PLOT_ONLY=True — loading saved results and regenerating summary plots...")
+        print(f"PLOT_ONLY=True — regenerating summary plots from {OUT_DIR / 'results'}...")
         run_summary_plots(OUT_DIR / 'results')
     else:
         # ── Full analysis ─────────────────────────────────────────────────────
-        print("Loading data...")
+        print(f"Loading data... [cell type mode: {CELL_TYPE_MODE} → "
+              f"{CELL_TYPE_GROUPS[CELL_TYPE_MODE]}]")
         trials_df, spikes_df, units_df = load_decoder_data(
             group_dict=GROUP_DICT,
-            msn_csv=MSN_CSV,
+            str_units_csv=STR_UNITS_CSV,
+            cell_types=CELL_TYPE_GROUPS[CELL_TYPE_MODE],
         )
 
         # Print full session table and get qualifying sessions

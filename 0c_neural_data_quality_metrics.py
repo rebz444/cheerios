@@ -354,4 +354,5 @@ out_path = p.LOGS_DIR / "RZ_unit_properties_with_qc.csv"
 up_df.to_csv(out_path, index=False)
 print(f"  Saved: {out_path}")
 
+print(f"\nPlots saved to: {QC_DIR}")
 print("Done.")

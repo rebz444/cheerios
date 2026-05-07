@@ -493,7 +493,6 @@ def figure2_all_alignments(results_df):
 
             ax.set_xticks(x)
             ax.set_xticklabels(['Last lick', 'Cue onset', 'Cue offset'], fontsize=10)
-            ax.set_ylim([0.5, 0.8])
             ax.axhline(0.5, color='gray', ls='--', alpha=0.4, lw=1)
             ax.set_ylabel('Peak time correlation (r)', fontsize=10)
             ax.set_title(f'{g_labels[group]} — {f_labels[filt]}',

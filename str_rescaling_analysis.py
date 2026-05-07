@@ -51,16 +51,26 @@ CACHE_FILE = DIR_HEATMAP / 'results_cache.pkl'
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
-_msn_id_cache = {}
+_cp_id_cache = {}
 
 
-def get_msn_unit_ids_for_session(session_id, unit_df):
-    if session_id not in _msn_id_cache:
-        mask = (unit_df['session_id'] == session_id) & (unit_df['cell_type'] == 'MSN')
+def get_cp_unit_ids_for_session(session_id, unit_df):
+    """Return the set of unit IDs in CP for a session.
+
+    Uses every CP-labelled neuron from 0h's output regardless of cell_type
+    (MSN, FSI, TAN, high_FR, etc.). Filtering on cell_type == 'MSN' previously
+    discarded interneurons that genuinely contribute to STR population coding.
+    """
+    if session_id not in _cp_id_cache:
+        # corrected_region is 0h's post-relabel canonical column. region_acronym
+        # is promoted to the same value at save time, so either works — use
+        # corrected_region for self-documentation.
+        col = 'corrected_region' if 'corrected_region' in unit_df.columns else 'region_acronym'
+        mask = (unit_df['session_id'] == session_id) & (unit_df[col] == 'CP')
         if 'qc_pass_all' in unit_df.columns:
             mask &= unit_df['qc_pass_all'] == True
-        _msn_id_cache[session_id] = set(unit_df.loc[mask, 'id'].tolist())
-    return _msn_id_cache[session_id]
+        _cp_id_cache[session_id] = set(unit_df.loc[mask, 'id'].tolist())
+    return _cp_id_cache[session_id]
 
 
 def get_spikes(unit_spk_df, trial_subset, t_start_col):
@@ -142,8 +152,8 @@ def pool_sessions(session_ids, unit_df, t_start_col, exclude_impulsive=False):
 
     for session_id in session_ids:
         _, trials, units = utils.get_session_data(session_id)
-        str_ids = get_msn_unit_ids_for_session(session_id, unit_df)
-        units   = {uid: spk for uid, spk in units.items() if uid in str_ids}
+        cp_ids = get_cp_unit_ids_for_session(session_id, unit_df)
+        units  = {uid: spk for uid, spk in units.items() if uid in cp_ids}
         if not units:
             continue
 
@@ -421,14 +431,18 @@ if __name__ == '__main__':
     mouse_to_group = {mouse: grp for grp, mice in c.GROUP_DICT.items() for mouse in mice}
     unit_df['group'] = unit_df['mouse'].map(mouse_to_group)
 
-    _msn_mask = unit_df['cell_type'] == 'MSN'
+    # All CP neurons (any cell_type) — drives the rescaling analysis. Filtering
+    # to cell_type == 'MSN' would discard CP interneurons (FSI/TAN/high_FR)
+    # that contribute to STR population dynamics.
+    _cp_col  = 'corrected_region' if 'corrected_region' in unit_df.columns else 'region_acronym'
+    _cp_mask = unit_df[_cp_col] == 'CP'
     if 'qc_pass_all' in unit_df.columns:
-        _msn_mask &= unit_df['qc_pass_all'] == True
-    all_msn_sessions = unit_df[_msn_mask]['session_id'].unique().tolist()
+        _cp_mask &= unit_df['qc_pass_all'] == True
+    all_cp_sessions = unit_df[_cp_mask]['session_id'].unique().tolist()
 
-    long_sessions  = [s for s in all_msn_sessions
+    long_sessions  = [s for s in all_cp_sessions
                       if any(s.startswith(m) for m in c.GROUP_DICT['l'])]
-    short_sessions = [s for s in all_msn_sessions
+    short_sessions = [s for s in all_cp_sessions
                       if any(s.startswith(m) for m in c.GROUP_DICT['s'])]
 
     print(f"Long BG sessions:  {len(long_sessions)}")

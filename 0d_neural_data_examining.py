@@ -41,9 +41,25 @@ OVERVIEW_DIR = p.DATA_DIR / "dataset_overview"
 OVERVIEW_DIR.mkdir(parents=True, exist_ok=True)
 
 QC_FILE = p.LOGS_DIR / "RZ_unit_properties_with_qc.csv"
+TRACKS_DIR = p.DATA_DIR / "probe_tracks"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def mice_with_tracks():
+    """Mice with at least one probe-track CSV in p.DATA_DIR / 'probe_tracks'.
+    Same scan logic used by 0f_neuron_location_matching.py."""
+    found = set()
+    if not TRACKS_DIR.exists():
+        return found
+    for mouse_dir in TRACKS_DIR.iterdir():
+        if not mouse_dir.is_dir():
+            continue
+        sub = mouse_dir / "brainreg_output" / "segmentation" / "sample_space" / "tracks"
+        if sub.exists() and any(sub.glob("*.csv")):
+            found.add(mouse_dir.name)
+    return found
+
 
 def get_session_length(trials):
     return trials["event_end_time"].iloc[-1] - trials["event_start_time"].iloc[0]
@@ -102,17 +118,22 @@ def print_dataset_overview(sessions_df):
     print("\nUnits by region:")
     print(sessions_df.groupby("region")["num_units"].sum().to_string())
 
-    histo_done = set(k.ALL_ANIMALS)
+    histo_done = mice_with_tracks()
     print(
-        f"\nHistology + clockspeed/rescaling complete "
-        f"(constants.ALL_ANIMALS, n={len(histo_done)}):"
+        f"\nHistology done (mice with at least one probe track CSV, "
+        f"n={len(histo_done)}): {sorted(histo_done)}"
     )
-    print(f"  early cohort ({len(k.EARLY_COHORT)}): {k.EARLY_COHORT}")
-    print(f"  later cohort ({len(k.LATER_COHORT)}): {k.LATER_COHORT}")
+    in_sessions = set(sessions_df["mouse"].unique())
+    no_sessions = sorted(histo_done - in_sessions)
+    if no_sessions:
+        print(f"  tracked but no sessions in sessions_df ({len(no_sessions)}): {no_sessions}")
     for label, grp in [("  short", "s"), ("  long ", "l")]:
         grp_mice = set(sessions_df.loc[sessions_df["group"] == grp, "mouse"].unique())
         done = sorted(grp_mice & histo_done)
+        missing = sorted(grp_mice - histo_done)
         print(f"{label}: {len(done)}/{len(grp_mice)} mice done -> {done}")
+        if missing:
+            print(f"          awaiting histology -> {missing}")
     print(bar)
 
 
@@ -313,4 +334,5 @@ print(
     )
 )
 
+print(f"\nPlots saved to: {OVERVIEW_DIR}")
 print("\nDone.")

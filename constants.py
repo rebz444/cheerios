@@ -79,11 +79,6 @@ COHORT_DICT = {
 # ── Electrophysiology ──────────────────────────────────────────────────────────
 FS = 30_000   # Neuropixels sampling rate (Hz)
 
-# ── Histology cohorts (animals with completed clearing + registration) ─────────
-EARLY_COHORT = ["RZ034", "RZ036", "RZ037", "RZ038", "RZ039"]
-LATER_COHORT = ["RZ047", "RZ049", "RZ050", "RZ051", "RZ053"]
-ALL_ANIMALS  = EARLY_COHORT + LATER_COHORT
-
 # ── Brain region color palette (colorblind-friendly, used across location scripts)
 REGION_COLORS = {
     "CP":      "#2166AC",

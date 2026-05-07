@@ -34,7 +34,7 @@ Scripts are numbered in run order:
 | 0b | `0b_neural_data_processing.ipynb` | Neural data ingestion |
 | 0c | `0c_neural_data_examining.ipynb` | Data examination |
 | 0d | `0d_neural_data_quality_metrics.ipynb/py` | Spike sorting QC |
-| 0e–0j | `0e_` … `0j_` | Neuron location matching, waveform diagnostics, cell-type relabeling, region labeling, track deviation |
+| 0e–0k | `0e_` … `0k_` | Track QC (`0e`), neuron location matching, waveform diagnostics, cell-type relabeling, region labeling, track deviation |
 | 1 | `1a_plot_raster_histo_by_quantile.ipynb` | Raster + PSTH plots |
 | 2 | `2_neuron_clustering.ipynb` | Neuron clustering & firing rate analysis |
 | 3 | `3a_bg_predict_time_waited.ipynb` | Behavioral prediction from background activity |
