@@ -4,7 +4,7 @@
 Applies spike-sorting QC thresholds to unit properties and exports pass/fail flags.
 
 Inputs:
-  RZ_unit_properties.csv  — unit properties (firing rate, SNR, ISI, drift, waveform, etc.)
+  p.RAW_DATA_DIR / 'RZ_unit_properties.csv'  — unit properties (firing rate, SNR, ISI, drift, waveform, etc.)
   Google Sheet recording log — session metadata (region, simultaneous recording flag)
 
 Outputs (p.DATA_DIR / 'qc_metrics/'):
@@ -17,7 +17,7 @@ Outputs (p.DATA_DIR / 'qc_metrics/'):
   qc_summary_by_region.csv        — pass rate per region
 
 Outputs (p.LOGS_DIR/):
-  RZ_unit_properties_with_qc.csv  — per-unit QC pass/fail flags
+  unit_properties_with_qc.csv  — per-unit QC pass/fail flags
 """
 
 import matplotlib
@@ -128,7 +128,7 @@ def scatter_plot(df, x_col, y_col, qc_pass_col, title, xlabel, ylabel,
 
 # ── 1. Load unit properties ────────────────────────────────────────────────────
 print("Loading unit properties...")
-up_df = pd.read_csv(p.LOGS_DIR / "RZ_unit_properties.csv")
+up_df = pd.read_csv(p.RAW_DATA_DIR / "RZ_unit_properties.csv")
 up_df = up_df.rename(columns={"subject": "mouse", "unit": "id", "session_datetime": "datetime"})
 up_df["date_only"] = pd.to_datetime(up_df["datetime"]).dt.date.astype(str)
 
@@ -136,8 +136,8 @@ print(f"  {len(up_df):,} units loaded")
 
 # Keep only manually labelled "good" units
 up_df = up_df[up_df["manual_label"].str.lower().eq("good")].reset_index(drop=True)
-up_df.to_csv(p.LOGS_DIR / "RZ_unit_properties_good.csv", index=False)
-print(f"  {len(up_df):,} 'good' units retained → saved RZ_unit_properties_good.csv")
+up_df.to_csv(p.LOGS_DIR / "unit_properties_good.csv", index=False)
+print(f"  {len(up_df):,} 'good' units retained → saved unit_properties_good.csv")
 
 # ── 2. Load recording log and merge session metadata ──────────────────────────
 print("Loading recording log from Google Sheets...")
@@ -350,7 +350,7 @@ qc_cols = [col for col in df.columns if col.startswith("qc_pass_")]
 up_df[qc_cols] = df[qc_cols]
 
 # Save full up_df (all unit properties + session metadata + qc_pass columns)
-out_path = p.LOGS_DIR / "RZ_unit_properties_with_qc.csv"
+out_path = p.LOGS_DIR / "unit_properties_with_qc.csv"
 up_df.to_csv(out_path, index=False)
 print(f"  Saved: {out_path}")
 

@@ -5,8 +5,8 @@ Combined waveform visualisation and FR/PT biological-prior validation.
 Replaces 0f_waveform_by_region.py and 0g_waveform_fr_validation.py.
 
 Requires:
-  LOGS_DIR / RZ_unit_properties_with_qc_and_regions.csv  (output of 0f)
-  LOGS_DIR / RZ_unit_templates.npz
+  LOGS_DIR / unit_properties_with_qc_and_regions.csv  (output of 0f)
+  RAW_DATA_DIR / RZ_unit_templates.npz
 
 Section 1 — Waveform by region
   [Plot 1] Mean ± SD waveforms per region
@@ -148,8 +148,8 @@ print("0g_waveform_diagnostic.py")
 print("=" * 60)
 
 _csv_candidates = [
-    p.LOGS_DIR / "RZ_unit_properties_with_qc_and_regions.csv",
-    p.LOGS_DIR / "RZ_unit_properties_with_regions.csv",
+    p.LOGS_DIR / "unit_properties_with_qc_and_regions.csv",
+    p.LOGS_DIR / "unit_properties_with_regions.csv",
 ]
 _csv_path = next((c for c in _csv_candidates if c.exists()), None)
 if _csv_path is None:
@@ -993,10 +993,11 @@ rt_broad = merged[
 print(f"  RT units with PT ≥ 0.35 ms (violates narrow prior): {len(rt_broad)}")
 
 if len(rt_broad) and "dist_along_track_um" in merged.columns and "track_file" in merged.columns:
-    # Per-track CP depth range (from CP-assigned units on the same probe)
+    # Per-(mouse, track) CP depth range (from CP-assigned units on the same probe).
+    # Keying on track_file alone collapses across mice when track names repeat.
     cp_depth_by_track = (
         merged[merged["region_acronym"] == "CP"]
-        .groupby("track_file")["dist_along_track_um"]
+        .groupby(["mouse", "track_file"])["dist_along_track_um"]
         .agg(cp_min="min", cp_max="max")
     )
 
@@ -1004,9 +1005,10 @@ if len(rt_broad) and "dist_along_track_um" in merged.columns and "track_file" in
     for _, u in rt_broad.iterrows():
         track = u.get("track_file")
         dist  = u.get("dist_along_track_um", np.nan)
-        if track in cp_depth_by_track.index and not np.isnan(dist):
-            cp_min = cp_depth_by_track.loc[track, "cp_min"]
-            cp_max = cp_depth_by_track.loc[track, "cp_max"]
+        key = (u["mouse"], track)
+        if key in cp_depth_by_track.index and not np.isnan(dist):
+            cp_min = cp_depth_by_track.loc[key, "cp_min"]
+            cp_max = cp_depth_by_track.loc[key, "cp_max"]
             # Gap = 0 if unit is within the CP range, else distance to nearest edge
             if dist < cp_min:
                 gap = cp_min - dist

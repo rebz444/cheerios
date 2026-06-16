@@ -6,12 +6,12 @@ metrics, and produces filtered session and unit lists. Also merges in the
 spike-sorting QC flags from 0c so units_vetted reflects BOTH:
 
   - session/recording-level filters (num_units, length, percent_trials_w_spikes)
-  - spike-sorting QC (qc_pass_all from RZ_unit_properties_with_qc.csv)
+  - spike-sorting QC (qc_pass_all from unit_properties_with_qc.csv)
 
 Inputs:
   p.LOGS_DIR / 'sessions_official_raw.csv'                 - from 0b
   per-session pickles in p.PICKLE_DIR                      - from 0b
-  p.LOGS_DIR / 'RZ_unit_properties_with_qc.csv' (optional) - from 0c
+  p.LOGS_DIR / 'unit_properties_with_qc.csv' (optional) - from 0c
     if absent, units_vetted falls back to recording-level filtering only.
 
 Outputs (p.LOGS_DIR):
@@ -40,7 +40,7 @@ import utils
 OVERVIEW_DIR = p.DATA_DIR / "dataset_overview"
 OVERVIEW_DIR.mkdir(parents=True, exist_ok=True)
 
-QC_FILE = p.LOGS_DIR / "RZ_unit_properties_with_qc.csv"
+QC_FILE = p.LOGS_DIR / "unit_properties_with_qc.csv"
 TRACKS_DIR = p.DATA_DIR / "probe_tracks"
 
 

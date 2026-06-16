@@ -32,6 +32,8 @@ TRIAL_NUM = "trial_id"
 BACKGROUND_LENGTH = "background_length"
 WAIT_LENGTH = "wait_length"
 BACKGROUND_WAIT_LENGTH = "background_wait_length"
+TIME_WAITED_SINCE_CUE_ON = "time_waited_since_cue_on"
+TIME_WAITED_SINCE_LAST_LICK = "time_waited_since_last_lick"
 REWARD_WAIT_LENGTH = ["missed", "rewarded", "wait_length"]
 
 # quality filters

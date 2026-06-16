@@ -5,8 +5,8 @@ Cross-checks the DataJoint pipeline progress log against the recording log
 to track which sessions are stuck at which pipeline stage.
 
 Inputs:
-  p.LOGS_DIR / 'RZ_dj_progress.csv'  - downloaded by progress_checker.py
-  Google Sheet recording log         - fetched at runtime
+  p.RAW_DATA_DIR / 'RZ_dj_progress.csv'  - downloaded by progress_checker.py
+  Google Sheet recording log             - fetched at runtime
 
 Outputs (p.LOGS_DIR):
   sessions_cross_checked.csv  - merged log with First_X_Column pipeline stage
@@ -28,7 +28,7 @@ RECORDING_LOG_URL = (
 
 
 def load_dj_progress():
-    df = pd.read_csv(p.LOGS_DIR / PROGRESS_FILE_NAME)
+    df = pd.read_csv(p.RAW_DATA_DIR / PROGRESS_FILE_NAME)
     df["date"] = pd.to_datetime(df["session_datetime"]).dt.date.astype(str)
     df["mouse"] = df["subject"].astype(str).str.strip()
     df["insertion_number"] = df["insertion_number"].astype(int)

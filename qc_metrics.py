@@ -4,7 +4,7 @@ qc_metrics.py
 Generates presentation-ready QC figures for thesis committee meeting.
 
 Inputs:
-  RZ_unit_properties_with_qc.csv  — per-unit QC flags (output of 0d_neural_data_quality_metrics.py)
+  unit_properties_with_qc.csv  — per-unit QC flags (output of 0d_neural_data_quality_metrics.py)
 
 Outputs (p.DATA_DIR / 'qc_metrics/committee/'):
   fig1_qc_distributions.png   — 2×3 panel: distribution of each primary QC metric with cutoffs
@@ -50,7 +50,7 @@ def apply_op(series, op, val):
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 print("Loading unit properties with QC flags...")
-df = pd.read_csv(p.LOGS_DIR / "RZ_unit_properties_with_qc.csv")
+df = pd.read_csv(p.LOGS_DIR / "unit_properties_with_qc.csv")
 print(f"  {len(df):,} units loaded")
 print(f"  Regions present: {sorted(df['region'].dropna().unique())}")
 

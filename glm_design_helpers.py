@@ -63,28 +63,50 @@ def build_epoch_masks(bin_edges: np.ndarray, bg_start: float, bg_end: float,
 
 
 def build_time_bases(bin_edges: np.ndarray, masks: Dict[str, np.ndarray],
-                     n_basis_bg: int = 8, n_basis_wait: int = 8, dt: float = 0.02) -> Dict[str, np.ndarray]:
-    """Raised-cosine bases for BG and WAIT epochs."""
+                     n_basis_bg: int = 8, n_basis_wait: int = 8, dt: float = 0.02,
+                     absolute_time: bool = True,
+                     t_max_bg: float = 5.0, t_max_wait: float = 10.0) -> Dict[str, np.ndarray]:
+    """Raised-cosine bases for BG and WAIT epochs.
+
+    If absolute_time is True (default), the basis is built once on a FIXED
+    grid [0, t_max] per epoch and evaluated at each bin's local time since
+    epoch onset. This means basis_j(t) takes the SAME value across trials
+    for the same absolute t — bins past t_max get clamped to the last grid
+    point (rare; covers essentially all waits with t_max_wait=10s).
+
+    If absolute_time is False, the legacy behavior is used: the basis is
+    built per-trial on [0, epoch_duration_i] and stretched to fit. This
+    makes basis_j(t) depend on the trial's total epoch duration —
+    "duration-warped" — which lets prev_X × basis_j interactions soak up
+    duration-shape variation and corrupted the M1_vs_M2 LRT calibration on
+    high-pR² units (see 4c_shuffle_control on MOp6a u224 and the stratified
+    diagnostic in 4c_wait_quartile_stratified for evidence).
+    """
     T = bin_edges.size - 1
     Xbg = np.zeros((T, n_basis_bg))
     Xw = np.zeros((T, n_basis_wait))
 
-    # make bases zero-mean within each epoch to avoid redundancy with boxcar/intercept
-    if np.any(masks["BG"]):
-        m = masks["BG"].astype(bool)
-        Xbg[m, :] -= Xbg[m, :].mean(axis=0, keepdims=True)
-    if np.any(masks["WAIT"]):
-        m = masks["WAIT"].astype(bool)
-        Xw[m, :] -= Xw[m, :].mean(axis=0, keepdims=True)
-
-    for epoch, n_basis, X in [("BG", n_basis_bg, Xbg), ("WAIT", n_basis_wait, Xw)]:
+    for epoch, n_basis, X, t_max in [
+        ("BG", n_basis_bg, Xbg, t_max_bg),
+        ("WAIT", n_basis_wait, Xw, t_max_wait),
+    ]:
         idx = np.where(masks[epoch] > 0)[0]
         if len(idx) == 0:
             continue
-        local = np.arange(len(idx)) * dt
-        basis = raised_cosine_basis(n_basis, local[-1] + dt, dt)
-        for i, k in enumerate(idx):
-            X[k, :] = basis[min(i, basis.shape[0]-1), :]
+        if absolute_time:
+            # Build basis ONCE on the fixed [0, t_max] grid.
+            basis = raised_cosine_basis(n_basis, t_max, dt)  # (~t_max/dt, n_basis)
+            last_grid = basis.shape[0] - 1
+            for i, k in enumerate(idx):
+                t = i * dt          # time since epoch onset (absolute)
+                grid_i = min(int(round(t / dt)), last_grid)
+                X[k, :] = basis[grid_i, :]
+        else:
+            # Legacy: per-trial duration-warped basis (kept for comparison)
+            local = np.arange(len(idx)) * dt
+            basis = raised_cosine_basis(n_basis, local[-1] + dt, dt)
+            for i, k in enumerate(idx):
+                X[k, :] = basis[min(i, basis.shape[0] - 1), :]
         if epoch == "BG":
             Xbg = X
         else:
@@ -203,11 +225,16 @@ def assemble_design(
     hazard_tau: float = 3.0,
     include_spike_history: bool = True,
     drop_cue_box: bool = True,
+    absolute_time_basis: bool = True,
+    t_max_bg: float = 5.0,
+    t_max_wait: float = 10.0,
 ) -> Tuple[np.ndarray, List[str], Dict[str, np.ndarray]]:
     """Build full design matrix and return (X, column_names, debug_info)."""
 
     masks = build_epoch_masks(bin_edges, bg_start, bg_end, wait_end)
-    bases = build_time_bases(bin_edges, masks, n_basis_bg, n_basis_wait, dt=dt)
+    bases = build_time_bases(bin_edges, masks, n_basis_bg, n_basis_wait, dt=dt,
+                             absolute_time=absolute_time_basis,
+                             t_max_bg=t_max_bg, t_max_wait=t_max_wait)
     B_bgwait = build_bgwait_basis(bin_edges, masks, n_basis_bgwait, dt=dt,
                                   B_bg=bases["B_BG"], B_wait=bases["B_WAIT"]) if n_basis_bgwait > 0 else np.zeros((bin_edges.size-1, 0))
     hazard = build_hazard(bin_edges, masks, tau=hazard_tau)

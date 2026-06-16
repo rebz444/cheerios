@@ -3,12 +3,12 @@ population_decoder.py
 ─────────────────────
 Run the full population-clock decoder pipeline on every session that meets
 the inclusion thresholds:
-    • > MIN_UNITS  striatal units (cell types per CELL_TYPE_MODE)
+    • > MIN_UNITS  units (selection per CELL_SETS entry)
     • > MIN_TRIALS valid (non-miss) trials
 
-The CELL_TYPE_MODE config selects which striatal cell types enter the
-population (MSN-only, all STR units, or MSN+FSI+TAN). Outputs are written
-to a mode-specific subdirectory so runs don't clobber each other.
+CELL_SETS lists the unit selections to run. The script loops over all sets by
+default, or a single set if passed as a positional CLI argument. Each set has
+its own output subdirectory so runs don't clobber each other.
 
 For each qualifying session the pipeline runs:
   1. Build population firing-rate matrices (Ridge regression)
@@ -18,11 +18,17 @@ For each qualifying session the pipeline runs:
   5. Time-matched confound control
   6. PCA trajectory visualisation
 
-Output (per session, saved to OUT_DIR/results/<session>/):
+Output (per set, saved to DIR_BASE/<set_label>/results/<session>/):
   decoder_performance_<session>.png
   clock_speed_analysis_<session>.png
   pca_trajectories_<session>.png
   trial_results_<session>.csv
+
+Usage:
+  python population_decoder.py                    # run all CELL_SETS (skips cached)
+  python population_decoder.py mc_l5l6            # run one set
+  python population_decoder.py msn --regenerate   # force rerun even if cached
+  python population_decoder.py msn --plot-only    # just regenerate summary plots
 """
 
 import pickle
@@ -40,6 +46,7 @@ from sklearn.linear_model import RidgeCV
 
 warnings.filterwarnings('ignore')
 
+import argparse
 import os
 
 import constants as c
@@ -47,20 +54,60 @@ import paths as p
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-# Cell type mode — which striatal cell types enter the decoding population.
-# 'msn'         → MSNs only (projection neurons; primary analysis)
-# 'all_str'     → all QC-passing STR units regardless of cell type
-# 'msn_fsi_tan' → canonical striatal types (excludes RS/high_FR/ambiguous)
-CELL_TYPE_MODE = 'msn'
+# Cell-set selections. Each entry slices rows from the canonical
+# unit_properties_final.csv (0h+0i output) via:
+#   filter_col  → boolean column gate (e.g. 'is_str_msn', 'is_mc_l5l6')
+#   cell_types  → restrict to specific cell_type values; composes with filter_col
+# The loader always applies qc_pass_all on top.
+#
+#   msn         → striatal MSNs (projection neurons; primary analysis)
+#   all_str     → all QC-passing STR units regardless of cell type
+#   msn_fsi_tan → canonical striatal types (excludes RS/high_FR/ambiguous)
+#   mc_l5l6     → motor cortex L5/L6 (MOp/MOs) on the str probe shank
+#   mc_l5l6_rs  → mc_l5l6 ∩ RS cells
+UPF = p.LOGS_DIR / 'unit_properties_final.csv'
 
-CELL_TYPE_GROUPS = {
-    'msn'        : ['MSN'],
-    'all_str'    : ['MSN', 'FSI', 'TAN', 'high_FR', 'RS', 'ambiguous'],
-    'msn_fsi_tan': ['MSN', 'FSI', 'TAN'],
+# Sweep can be expanded to [5, 8, 10, 15] once the 15-unit pass identifies
+# regions worth investigating at relaxed thresholds.
+_REGION_SWEEP = [15]
+
+CELL_SETS = {
+    'msn':         {'csv': UPF, 'filter_col': 'is_str_msn',
+                    'min_units_sweep': [5, 8, 15]},
+    'all_str':     {'csv': UPF, 'filter_col': 'is_str_unit'},
+    'msn_fsi_tan': {'csv': UPF, 'filter_col': 'is_str_unit', 'cell_types': ['MSN', 'FSI', 'TAN']},
+    'mc_l5l6':     {'csv': UPF, 'filter_col': 'is_mc_l5l6'},
+    'mc_l5l6_rs':  {'csv': UPF, 'filter_col': 'is_mc_l5l6', 'cell_types': ['RS'],
+                    'min_units_sweep': [5, 8, 10, 15]},
+
+    # Region-comparison panel (Pivot B). Per-session unit counts in thalamic
+    # nuclei sit below the legacy MIN_UNITS=15 threshold, so each set is swept
+    # over [5, 8, 10, 15] and the threshold for the headline figure is chosen
+    # post-hoc from the sweep result.
+    'val':  {'csv': UPF, 'filter_col': 'is_val',  'pickle_suffixes': ('_str.pkl',),           'min_units_sweep': _REGION_SWEEP},
+    'po':   {'csv': UPF, 'filter_col': 'is_po',   'pickle_suffixes': ('_str.pkl',),           'min_units_sweep': _REGION_SWEEP},
+    'vpm':  {'csv': UPF, 'filter_col': 'is_vpm',  'pickle_suffixes': ('_str.pkl',),           'min_units_sweep': _REGION_SWEEP},
+    'thal': {'csv': UPF, 'filter_col': 'is_thal', 'pickle_suffixes': ('_str.pkl',),           'min_units_sweep': _REGION_SWEEP},
+    'v1':   {'csv': UPF, 'filter_col': 'is_visp', 'pickle_suffixes': ('_v1.pkl', '_str.pkl'), 'min_units_sweep': _REGION_SWEEP},
+    'ca1':  {'csv': UPF, 'filter_col': 'is_ca1',  'pickle_suffixes': ('_v1.pkl',),            'min_units_sweep': _REGION_SWEEP},
+    'hpf':  {'csv': UPF, 'filter_col': 'is_hpf',  'pickle_suffixes': ('_v1.pkl',),            'min_units_sweep': _REGION_SWEEP},
 }
 
-STR_UNITS_CSV = p.LOGS_DIR / 'RZ_str_units.csv'  # All STR units w/ cell_type — output of 0g
-OUT_DIR = p.DATA_DIR / 'population_decoding' / CELL_TYPE_MODE
+DIR_BASE = p.DATA_DIR / 'population_decoding'
+
+
+def paths_for(set_label, min_units=None):
+    """Return (out_dir, results_dir, summary_csv) for a cell set.
+
+    If `min_units` is provided, outputs are nested under `min_units_<N>/`
+    so a sweep over multiple thresholds (e.g. for thalamic nuclei where the
+    per-session unit count is well below the legacy default of 15) does not
+    overwrite itself between runs.
+    """
+    out = DIR_BASE / set_label
+    if min_units is not None:
+        out = out / f'min_units_{min_units}'
+    return out, out / 'results', out / 'results' / 'session_summary.csv'
 
 # Inclusion thresholds
 MIN_UNITS  = 15
@@ -93,10 +140,10 @@ N_SHUFFLES = 50
 # Decoder mode
 # False → pooled only (fast, ~2-3 min/session)
 # True  → pooled + LOTO with comparison figures (~12-18 min/session)
-USE_LOTO = True
-
-# Set True to skip analysis and regenerate summary plots from saved CSVs only
-PLOT_ONLY = False
+# Temporarily False for the region-comparison panel sweep; pooled-only gives
+# pooled_history_d which is what the headline figure needs. Flip back to True
+# (and pass --regenerate) for full LOTO runs on regions worth deeper investigation.
+USE_LOTO = False
 
 # Sessions to exclude from decoding
 EXCLUDE_SESSIONS = set()
@@ -122,7 +169,8 @@ ANCHOR_COLORS = {
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 def load_decoder_data(group_dict=None, unit_csv=None, str_units_csv=None,
-                      cell_types=None, pickle_dir=None):
+                      cell_types=None, filter_col=None, pickle_dir=None,
+                      pickle_suffixes=('_str.pkl',)):
     """
     Build trials_df, spikes_df, units_df from per-session pickle files.
 
@@ -132,17 +180,19 @@ def load_decoder_data(group_dict=None, unit_csv=None, str_units_csv=None,
         {'Long BG': [mouse_ids], 'Short BG': [mouse_ids]}
         Defaults to constants.GROUP_DICT with 'l' → 'Long BG', 's' → 'Short BG'.
     unit_csv : str or Path, optional
-        Path to RZ_unit_properties_with_qc_and_regions.csv (output of 0e).
+        Path to unit_properties_with_qc_and_regions.csv (output of 0e).
         If provided, only QC-passing CP/STR units are included; otherwise all
         units are used. Ignored when str_units_csv is provided.
     str_units_csv : str or Path, optional
-        Path to RZ_str_units.csv (output of 0h_cell_type_relabeling) — all
-        units physically in striatum, with a `cell_type` column. Takes
-        precedence over unit_csv. Combine with `cell_types` to subset by
-        cell type. Filters by qc_pass_all when present.
+        Path to a unit-selection CSV (canonical: unit_properties_final.csv from
+        0h+0i). Takes precedence over unit_csv. Filters by qc_pass_all when
+        the column is present. Combine with `filter_col` (boolean column
+        gating) and/or `cell_types` (cell_type-value gating) to subset rows.
     cell_types : list of str, optional
-        Cell types to include when using str_units_csv (e.g. ['MSN'],
-        ['MSN', 'FSI', 'TAN']). If None, all cell types in the CSV are kept.
+        Restrict to rows whose `cell_type` column is in this list.
+    filter_col : str, optional
+        Name of a boolean column in str_units_csv to gate rows by True
+        (e.g. 'is_str_msn', 'is_mc_l5l6'). Composes with cell_types.
     pickle_dir : str or Path, optional
         Directory containing per-session .pkl files. Defaults to paths.PICKLE_DIR.
 
@@ -183,6 +233,10 @@ def load_decoder_data(group_dict=None, unit_csv=None, str_units_csv=None,
     str_df = None
     if str_units_csv is not None and os.path.exists(str(str_units_csv)):
         str_df = pd.read_csv(str_units_csv)
+        if filter_col is not None:
+            if filter_col not in str_df.columns:
+                raise ValueError(f"filter_col='{filter_col}' not in {str_units_csv}")
+            str_df = str_df[str_df[filter_col] == True].copy()
         if cell_types is not None:
             str_df = str_df[str_df['cell_type'].isin(cell_types)].copy()
 
@@ -193,9 +247,11 @@ def load_decoder_data(group_dict=None, unit_csv=None, str_units_csv=None,
     all_trials, all_spikes, all_units = [], [], []
 
     for fname in sorted(os.listdir(pickle_dir)):
-        if not fname.endswith('_str.pkl'):
+        suffix_match = next((s for s in pickle_suffixes if fname.endswith(s)), None)
+        if suffix_match is None:
             continue
-        session_id = fname[:-4]
+        session_id   = fname[:-4]
+        probe_label  = suffix_match.lstrip('_').removesuffix('.pkl').upper()  # 'STR' / 'V1'
 
         with open(os.path.join(pickle_dir, fname), 'rb') as f:
             sess = pickle.load(f)
@@ -239,7 +295,7 @@ def load_decoder_data(group_dict=None, unit_csv=None, str_units_csv=None,
             all_units.append({
                 'session'     : session_id,
                 'unit_id'     : uid,
-                'probe_region': 'STR',
+                'probe_region': probe_label,
                 'mouse_id'    : mouse,
             })
 
@@ -289,7 +345,10 @@ def load_decoder_data(group_dict=None, unit_csv=None, str_units_csv=None,
 
     n_sess = trials_df['session'].nunique() if not trials_df.empty else 0
     if str_df is not None:
-        unit_src = f"STR[{','.join(cell_types)}]" if cell_types else "STR[all]"
+        bits = []
+        if filter_col is not None: bits.append(filter_col)
+        if cell_types is not None: bits.append('cell_type∈' + ','.join(cell_types))
+        unit_src = '[' + ('+'.join(bits) if bits else 'all') + ']'
     elif qc_df is not None:
         unit_src = "QC STR"
     else:
@@ -309,6 +368,11 @@ def get_qualifying_sessions(trials_df, units_df,
     unit and trial thresholds.
     """
     rows = []
+    if units_df.empty or 'session' not in units_df.columns:
+        print("\n  [get_qualifying_sessions] empty units_df — no qualifying sessions.")
+        return pd.DataFrame(columns=['group', 'session', 'mouse', 'n_units',
+                                     'n_valid_trials', 'n_trials_all'])
+
     for group, mice in group_dict.items():
         sess_list = trials_df[trials_df['mouse_id'].isin(mice)]['session'].unique()
 
@@ -1499,8 +1563,16 @@ def run_anchor_decoders(t_sess, s_sess):
     Returns
     -------
     dict keyed by anchor key ('cue_on', 'cue_off', 'last_lick'), each value:
-        {'mae': float, 'r': float, 'r2': float, 'n_trials': int}
+        {'mae': float, 'r': float, 'r2': float, 'n_trials': int,
+         'speeds': <extract_clock_speeds output>,
+         'history_stats': <analyze_history_effect output>}
         or None if the anchor column is missing / too few trials.
+
+    `speeds` is the dict from extract_clock_speeds (per-trial clock_speed,
+    intercept, r²); `history_stats` is the dict from analyze_history_effect
+    (after_reward_mean, after_no_reward_mean, cohens_d, p_ttest, p_mwu,
+    plus the per-trial speed/prev_rewarded/tw arrays). These power the
+    cross-region figures (cross_region_decoder.py).
     """
     results = {}
     for key, col in ANCHOR_COLS.items():
@@ -1512,15 +1584,19 @@ def run_anchor_decoders(t_sess, s_sess):
         if data is None or data['n_trials'] < 10:
             results[key] = None
             continue
-        dec = pooled_decode(data)
+        dec    = pooled_decode(data)
+        speeds = extract_clock_speeds(dec)
+        hist   = analyze_history_effect(dec, speeds)
         y_true = np.concatenate(dec['y_true'])
         y_pred = np.concatenate(dec['y_pred'])
         r, _   = pearsonr(y_true, y_pred)
         results[key] = {
-            'mae'     : dec['mae_per_trial'].mean(),
-            'r'       : r,
-            'r2'      : r ** 2,
-            'n_trials': data['n_trials'],
+            'mae'          : dec['mae_per_trial'].mean(),
+            'r'            : r,
+            'r2'           : r ** 2,
+            'n_trials'     : data['n_trials'],
+            'speeds'       : speeds,
+            'history_stats': hist,
         }
     return results
 
@@ -1878,10 +1954,10 @@ def plot_time_matched_summary(all_raw_caches, save_dir):
 
 # ── Cross-session summary plots ───────────────────────────────────────────────
 
-def run_summary_plots(results_dir=None):
+def run_summary_plots(results_dir):
     """
-    Load saved CSVs and regenerate cross-session summary figures.
-    Can be called independently (PLOT_ONLY = True) without re-running analysis.
+    Load saved CSVs and regenerate cross-session summary figures. Can be
+    called independently (--plot-only) without re-running analysis.
 
     Reads from:
       results_dir/session_summary.csv      — one row per session
@@ -1892,8 +1968,6 @@ def run_summary_plots(results_dir=None):
       results_dir/summary_clock_speed.png
       results_dir/summary_history_effect.png
     """
-    if results_dir is None:
-        results_dir = OUT_DIR / 'results'
     results_dir = results_dir if hasattr(results_dir, '__fspath__') else __import__('pathlib').Path(results_dir)
 
     summary_path = results_dir / 'session_summary.csv'
@@ -2113,60 +2187,212 @@ def run_summary_plots(results_dir=None):
     print(f"\nSummary plots written to: {results_dir}")
 
 
+# ── Per-set runner ────────────────────────────────────────────────────────────
+
+def run_for_cell_set(set_label, config, regenerate=False, plot_only=False):
+    """Load data, decode every qualifying session, save outputs for one cell set.
+
+    `config` is a dict with keys:
+        'csv'              — path to the unit-selection CSV (required)
+        'filter_col'       — optional boolean column to gate rows by True
+        'cell_types'       — optional list filtering by `cell_type` column
+        'pickle_suffixes'  — tuple of session-pickle suffixes to load
+                             (default ('_str.pkl',); use ('_v1.pkl','_str.pkl')
+                             for cortex-on-V1-probe sets)
+        'min_units_sweep'  — list of MIN_UNITS thresholds to evaluate
+                             (default [MIN_UNITS]; multi-value runs nest
+                             outputs under min_units_<N>/)
+
+    If session_summary.csv already exists and `regenerate` is False, that
+    (set, min_units) cell is skipped. With `plot_only=True`, only summary
+    plots are regenerated from the existing per-session CSVs.
+    """
+    csv_path        = config['csv']
+    filter_col      = config.get('filter_col')
+    cell_types      = config.get('cell_types')
+    pickle_suffixes = tuple(config.get('pickle_suffixes', ('_str.pkl',)))
+    sweep           = list(config.get('min_units_sweep', [MIN_UNITS]))
+
+    # Single-value legacy behaviour (no nesting) is preserved when the sweep
+    # is just the canonical default; multi-value or non-default sweeps nest.
+    nest_outputs = (len(sweep) > 1 or sweep[0] != MIN_UNITS)
+
+    print("\n" + "=" * 72)
+    print(f"  CELL SET: {set_label}")
+    print(f"  Source:   {csv_path}")
+    if filter_col:
+        print(f"  filter_col: {filter_col} == True")
+    if cell_types:
+        print(f"  cell_types: {cell_types}")
+    print(f"  pickle_suffixes: {pickle_suffixes}")
+    print(f"  min_units_sweep: {sweep}{'  (nested)' if nest_outputs else ''}")
+    print("=" * 72)
+
+    if not csv_path.exists():
+        print(f"  [SKIP] CSV not found: {csv_path}")
+        return
+
+    # Data loading is independent of MIN_UNITS — do it once and reuse across
+    # the sweep. get_qualifying_sessions applies the threshold each pass.
+    trials_df = spikes_df = units_df = None
+
+    for mu in sweep:
+        mu_tag = mu if nest_outputs else None
+        out_dir, results_dir, summary_csv = paths_for(set_label, min_units=mu_tag)
+
+        if plot_only:
+            print(f"\n  [min_units={mu}] --plot-only — regenerating summary plots from {results_dir}")
+            run_summary_plots(results_dir)
+            continue
+
+        if summary_csv.exists() and not regenerate:
+            print(f"\n  [min_units={mu}] [CACHED] {summary_csv} — pass --regenerate to rerun.")
+            continue
+
+        if trials_df is None:
+            trials_df, spikes_df, units_df = load_decoder_data(
+                group_dict=GROUP_DICT,
+                str_units_csv=csv_path,
+                filter_col=filter_col,
+                cell_types=cell_types,
+                pickle_suffixes=pickle_suffixes,
+            )
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n  ── min_units = {mu} ─────────────────────────────────")
+        qualifying = get_qualifying_sessions(
+            trials_df, units_df, min_units=mu, min_trials=MIN_TRIALS,
+        )
+        if qualifying.empty:
+            print(f"  No sessions meet threshold min_units>{mu}. Skipping.")
+            continue
+
+        all_results = []
+        for _, row in qualifying.iterrows():
+            sess     = row['session']
+            group    = row['group']
+            sess_dir = results_dir / sess
+            try:
+                result = run_analysis(sess, group, trials_df, spikes_df, sess_dir)
+                all_results.append(result)
+            except Exception as e:
+                print(f"\nERROR — {sess}: {e}")
+
+        if all_results:
+            summary_df = pd.DataFrame(all_results)
+            summary_df.insert(0, 'min_units', mu)
+            summary_csv.parent.mkdir(parents=True, exist_ok=True)
+            summary_df.to_csv(summary_csv, index=False)
+            print(f"\n{'='*72}")
+            print(f"  [{set_label} | min_units={mu}] SESSION SUMMARY")
+            print(f"{'='*72}")
+            cols = ['session_id', 'group',
+                    'pooled_r2', 'pooled_mae', 'pooled_shuffle_p',
+                    'pooled_history_p', 'pooled_history_d']
+            if USE_LOTO:
+                cols += ['loto_r2', 'loto_mae', 'loto_shuffle_p',
+                         'loto_history_p', 'loto_history_d']
+            cols = [c for c in cols if c in summary_df.columns]
+            print(summary_df[cols].to_string(index=False))
+            print(f"\n  Summary CSV  → {summary_csv}")
+
+            run_summary_plots(results_dir)
+            print(f"  Output dir   → {results_dir}")
+
+
+def combine_session_summaries():
+    """Concatenate every set's session_summary.csv into one long-form CSV.
+
+    Adds cell_set / csv_source / filter_col / cell_types / min_units columns
+    so each row is self-describing. Walks both legacy (un-nested) and
+    min_units_<N>/ swept output directories. Also prints a per-set aggregate
+    (n_sessions, mean R², mean MAE) for quick comparison.
+    """
+    rows = []
+    for label, cfg in CELL_SETS.items():
+        sweep        = list(cfg.get('min_units_sweep', [MIN_UNITS]))
+        nest_outputs = (len(sweep) > 1 or sweep[0] != MIN_UNITS)
+        ct           = cfg.get('cell_types')
+
+        candidates = [(mu, paths_for(label, min_units=mu if nest_outputs else None))
+                      for mu in sweep]
+        for mu, (_, _, summary_csv) in candidates:
+            if not summary_csv.exists():
+                continue
+            df = pd.read_csv(summary_csv)
+            if df.empty:
+                continue
+            df.insert(0, 'cell_set',   label)
+            df.insert(1, 'csv_source', cfg['csv'].name)
+            df.insert(2, 'filter_col', cfg.get('filter_col') or '')
+            df.insert(3, 'cell_types', ','.join(ct) if ct else '')
+            if 'min_units' not in df.columns:
+                df.insert(4, 'min_units', mu)
+            rows.append(df)
+
+    if not rows:
+        print("\n  [combine_session_summaries] no per-set summaries found.")
+        return
+
+    combined = pd.concat(rows, ignore_index=True)
+    out = DIR_BASE / 'results_summary_all_sets.csv'
+    out.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(out, index=False)
+
+    agg_cols = {
+        'n_sessions':     ('session_id', 'nunique'),
+        'mean_pooled_r2': ('pooled_r2', 'mean'),
+        'med_pooled_r2':  ('pooled_r2', 'median'),
+        'mean_pooled_mae':('pooled_mae', 'mean'),
+    }
+    if 'loto_r2' in combined.columns:
+        agg_cols['mean_loto_r2'] = ('loto_r2', 'mean')
+    group_cols = ['cell_set', 'filter_col', 'cell_types']
+    if 'min_units' in combined.columns and combined['min_units'].nunique() > 1:
+        group_cols.append('min_units')
+    agg = combined.groupby(group_cols, dropna=False).agg(**agg_cols).round(3)
+
+    print(f"\n  Cross-set summary CSV → {out}")
+    print(f"  Per-set aggregate ({len(combined)} session-rows):")
+    print(agg.to_string())
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(
+        description="Population-clock decoder (loops over cell-type sets)."
+    )
+    parser.add_argument('cell_set', nargs='?', default=None,
+                        help=f"Run only this set. Default: loop over all "
+                             f"({list(CELL_SETS.keys())}).")
+    parser.add_argument('--regenerate', action='store_true',
+                        help="Force rerun even if session_summary.csv exists.")
+    parser.add_argument('--plot-only', action='store_true',
+                        help="Skip analysis; just regenerate summary plots from saved CSVs.")
+    args = parser.parse_args()
 
-    if PLOT_ONLY:
-        # ── Skip analysis, regenerate summary plots from saved CSVs ──────────
-        print(f"PLOT_ONLY=True — regenerating summary plots from {OUT_DIR / 'results'}...")
-        run_summary_plots(OUT_DIR / 'results')
+    if args.cell_set is not None:
+        if args.cell_set not in CELL_SETS:
+            raise ValueError(
+                f"Unknown cell set '{args.cell_set}'. "
+                f"Available: {list(CELL_SETS.keys())}"
+            )
+        sets_to_run = [args.cell_set]
     else:
-        # ── Full analysis ─────────────────────────────────────────────────────
-        print(f"Loading data... [cell type mode: {CELL_TYPE_MODE} → "
-              f"{CELL_TYPE_GROUPS[CELL_TYPE_MODE]}]")
-        trials_df, spikes_df, units_df = load_decoder_data(
-            group_dict=GROUP_DICT,
-            str_units_csv=STR_UNITS_CSV,
-            cell_types=CELL_TYPE_GROUPS[CELL_TYPE_MODE],
+        sets_to_run = list(CELL_SETS.keys())
+        print(f"  No cell-set argument — looping over all: {sets_to_run}")
+
+    for label in sets_to_run:
+        run_for_cell_set(
+            label, CELL_SETS[label],
+            regenerate=args.regenerate, plot_only=args.plot_only,
         )
 
-        # Print full session table and get qualifying sessions
-        qualifying = get_qualifying_sessions(trials_df, units_df)
+    combine_session_summaries()
 
-        if qualifying.empty:
-            print("\nNo sessions meet the threshold. Adjust MIN_UNITS / MIN_TRIALS.")
-        else:
-            all_results = []
-            for _, row in qualifying.iterrows():
-                sess     = row['session']
-                group    = row['group']
-                sess_dir = OUT_DIR / 'results' / sess
-                try:
-                    result = run_analysis(sess, group, trials_df, spikes_df, sess_dir)
-                    all_results.append(result)
-                except Exception as e:
-                    print(f"\nERROR — {sess}: {e}")
-
-            # Summary table across all sessions
-            if all_results:
-                summary_df   = pd.DataFrame(all_results)
-                summary_path = OUT_DIR / 'results' / 'session_summary.csv'
-                summary_df.to_csv(summary_path, index=False)
-                print(f"\n{'='*72}")
-                print("ALL SESSIONS SUMMARY")
-                print(f"{'='*72}")
-                cols = ['session_id', 'group',
-                        'pooled_r2', 'pooled_mae', 'pooled_shuffle_p',
-                        'pooled_history_p', 'pooled_history_d']
-                if USE_LOTO:
-                    cols += ['loto_r2', 'loto_mae', 'loto_shuffle_p',
-                             'loto_history_p', 'loto_history_d']
-                print(summary_df[cols].to_string(index=False))
-                print(f"\nSummary saved to: {summary_path}")
-
-                # Generate summary plots after analysis
-                run_summary_plots(OUT_DIR / 'results')
-
-        print(f"\nDone. All output in {OUT_DIR / 'results'}")
+    print("\n" + "=" * 72)
+    print("  All cell sets complete. Per-set output under:")
+    print(f"    {DIR_BASE}/<set_label>/results/")
+    print("=" * 72)

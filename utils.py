@@ -30,7 +30,7 @@ def load_waveform_metrics(df, join_how="inner"):
     waveforms_norm : np.ndarray (n_matched, T)  — trough-normalised waveforms
     t_ms           : np.ndarray (T,)            — time axis in milliseconds
     """
-    raw       = np.load(p.LOGS_DIR / "RZ_unit_templates.npz", allow_pickle=True)
+    raw       = np.load(p.RAW_DATA_DIR / "RZ_unit_templates.npz", allow_pickle=True)
     templates = raw["templates"]
     cols      = [str(c) for c in raw["columns"]]
     uid_df = (

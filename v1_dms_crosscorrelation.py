@@ -9,8 +9,9 @@ Analysis:
   1. Load simultaneous V1 + STR sessions from the recording log (Google Sheets).
      A session is simultaneous only if the recording log marks BOTH the V1 and
      STR insertions as simultaneous on the same date.
-  2. Filter V1 units to visual-cortex neurons (RZ_v1_cortical.csv, waveform-verified).
-     Filter STR units to MSNs (RZ_str_msn.csv, output of 0h_cell_type_relabeling).
+  2. Filter V1 units to visual-cortex neurons on the V1 probe, derived live from
+     unit_properties_final.csv. Filter STR units to MSNs from str_msn.csv (output
+     of 0h_cell_type_relabeling). Both sides require qc_pass_all == True.
   3. Compute jitter-corrected spike cross-correlograms for all V1-MSN unit pairs.
   4. Test for V1-lead latency (~5-15 ms expected for monosynaptic corticostriatal).
 
@@ -46,13 +47,11 @@ OUT_DIR = p.DATA_DIR / 'v1_dms_crosscorrelation'
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Unit metadata CSVs ────────────────────────────────────────────────────────
-# NOTE: RZ_v1_cortical.csv is a stale artifact from the old 0g_v1 run; current 0h
-# does not regenerate it. The current `RZ_cortex_units.csv` is NOT a safe substitute
-# (it mixes V1 probe + STR probe shallow including thalamus/hippocampus). Either
-# re-create the V1-cortex-only filter from RZ_unit_properties_final.csv, or extend
-# 0h to output a proper RZ_v1_cortical.csv. Until then this path will go stale.
-V1_CSV  = p.LOGS_DIR / 'RZ_v1_cortical.csv'   # ⚠ stale — see note above
-MSN_CSV = p.LOGS_DIR / 'RZ_str_msn.csv'       # output of 0h_cell_type_relabeling
+# Both V1 and MSN selections come from the canonical unit_properties_final.csv
+# (0h+0i): V1 cortical = is_v1_cortical, MSN = is_str_msn (both gated by
+# qc_pass_all). Per-set CSVs (str_msn.csv, v1_cortical.csv) are no longer
+# emitted by 0h.
+UNIT_PROPS_CSV = p.LOGS_DIR / 'unit_properties_final.csv'
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -68,8 +67,8 @@ def find_simultaneous_sessions():
     Simultaneity is determined from the Google Sheets recording log: a session
     counts only if both the V1 insertion AND the STR insertion are marked 'y'.
     """
-    # Recording log (local copy of Google Sheets)
-    log = pd.read_csv(p.LOGS_DIR / 'recording_log.csv')
+    # Recording log (local copy of Google Sheets, exported as sessions_all.csv)
+    log = pd.read_csv(p.LOGS_DIR / 'sessions_all.csv')
     log['region'] = log['region'].str.strip().str.lower()
     log['simultaneous'] = log['simultaneous'].str.strip().str.lower()
 
@@ -79,14 +78,15 @@ def find_simultaneous_sessions():
     both_probes = by_session[by_session.apply(lambda s: 'v1' in s and 'str' in s)]
     sim_sessions = both_probes.index.tolist()  # list of (mouse, date) tuples
 
-    # Load unit metadata
-    v1_df  = pd.read_csv(V1_CSV)
-    msn_df = pd.read_csv(MSN_CSV)
+    # Load unit metadata; both selections derive from the canonical CSV.
+    props  = pd.read_csv(UNIT_PROPS_CSV)
+    qc     = props['qc_pass_all'] == True
+    v1_df  = props[qc & (props['is_v1_cortical'] == True)].copy()
+    msn_df = props[qc & (props['is_str_msn']     == True)].copy()
 
     v1_df['date_str']  = pd.to_datetime(v1_df['datetime']).dt.strftime('%Y-%m-%d')
     msn_df['date_str'] = pd.to_datetime(msn_df['datetime']).dt.strftime('%Y-%m-%d')
 
-    # v1_cortical is True for all rows in RZ_v1_cortical.csv (already filtered)
     # Build per-session unit ID sets
     v1_by_session  = v1_df.groupby(['mouse', 'date_str'])['id'].apply(set).to_dict()
     msn_by_session = msn_df.groupby(['mouse', 'date_str'])['id'].apply(set).to_dict()

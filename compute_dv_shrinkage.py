@@ -2,7 +2,7 @@
 compute_dv_shrinkage.py
 ========================
 Compute per-mouse DV tissue-shrinkage scale factors from brainreg output and
-write them to LOGS_DIR / RZ_dv_shrinkage.csv. Run this whenever a new mouse
+write them to LOGS_DIR / dv_shrinkage.csv. Run this whenever a new mouse
 finishes brainreg registration.
 
 Method:
@@ -20,7 +20,7 @@ Inputs:
   TRACKS_ROOT/<mouse>/brainreg_output/brainreg.json   (for atlas name)
 
 Outputs:
-  LOGS_DIR / RZ_dv_shrinkage.csv
+  LOGS_DIR / dv_shrinkage.csv
   PLOT_DIR / dv_shrinkage_per_animal.png   (sanity bar plot)
 """
 
@@ -40,7 +40,7 @@ TRACKS_ROOT = Path("/Volumes/T7 Shield/brain_stitching")
 CCF_DV_UM   = 8000.0
 DV_AXIS     = 1   # CCF canonical: axis 0=AP, axis 1=DV, axis 2=ML
 
-OUT_CSV  = p.LOGS_DIR / "RZ_dv_shrinkage.csv"
+OUT_CSV  = p.LOGS_DIR / "dv_shrinkage.csv"
 PLOT_DIR = p.DATA_DIR / "location_matching"
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
 

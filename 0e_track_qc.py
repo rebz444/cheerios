@@ -33,7 +33,7 @@ deviation) are reported but not gating. The straightness metric flags tracks
 with max bend > STRAIGHTNESS_THRESHOLD_UM for review.
 
 Outputs:
-  RZ_track_qc.csv                  — one row per track, written to LOGS_DIR
+  track_qc.csv                  — one row per track, written to LOGS_DIR
   qc_track_vs_insertion.png        — depth-consistency histograms
   qc_track_vs_insertion_scatter.png — track length vs insertion-depth scatter
 """
@@ -57,9 +57,9 @@ TRACKS_ROOT      = Path("/Volumes/T7 Shield/brain_stitching")
 LOCAL_TRACKS_DIR = p.DATA_DIR / "probe_tracks"
 PLOT_DIR         = p.DATA_DIR / "location_matching"
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
-OUT_CSV          = p.LOGS_DIR / "RZ_track_qc.csv"
+OUT_CSV          = p.LOGS_DIR / "track_qc.csv"
 
-_DV_SCALE_CSV = p.LOGS_DIR / "RZ_dv_shrinkage.csv"
+_DV_SCALE_CSV = p.LOGS_DIR / "dv_shrinkage.csv"
 
 _RECORDING_LOG_SHEET_ID = "1xpb52EO7BII-_5zIcB2HaOpZqepFcYTvBYgxA4zLyNo"
 RECORDING_LOG_URL = (
@@ -149,9 +149,7 @@ def track_length_um(csv_path):
     return float(pd.read_csv(csv_path).iloc[:, 1].max())
 
 
-# ── Region groupings (for coverage plot + miss diagnosis) ──────────────────────
-# Used by diagnose_miss() to classify what regions a track ended in, and by
-# the region-profiles plot to colour stacked-bar coverage.
+# ── Region groupings (for coverage plot) ──────────────────────────────────────
 REGION_GROUPS = {
     "cortex":   {"prefixes": ("MO", "SS", "ACA", "PL", "ILA", "ORB", "AI"),
                  "color":    "#4DAF4A"},
@@ -182,24 +180,6 @@ def classify_region(acronym):
         if "prefixes" in spec and a.startswith(spec["prefixes"]):
             return group
     return "other"
-
-
-def diagnose_miss(cp_in_sequence, region_sequence, track_length_um_):
-    """Classify why a track missed CP. region_sequence is a list of acronyms
-    (run-length encoded)."""
-    if cp_in_sequence:
-        return "OK"
-    if not region_sequence:
-        return "Missed CP — empty sequence"
-    seq_str = "→".join(region_sequence[:6])
-    deep_groups = {classify_region(r) for r in region_sequence[-5:]}
-    if "thalamus" in deep_groups:
-        return f"Overshot posteriorly into thalamus ({seq_str}…)"
-    if "PAL" in deep_groups:
-        return f"Reached pallidum but not CP ({seq_str}…)"
-    if "cortex" in deep_groups and track_length_um_ < 3000:
-        return f"Insufficient depth — stayed in cortex ({track_length_um_:.0f} µm)"
-    return f"Missed CP — path: {seq_str}…"
 
 
 def compute_straightness(pts: np.ndarray, csv_total_um: float):
@@ -248,9 +228,16 @@ copy_tracks_from_ssd()
 
 # ── 1. Load DV shrinkage, recording log, and units ─────────────────────────────
 if not _DV_SCALE_CSV.exists():
-    raise FileNotFoundError(
-        f"{_DV_SCALE_CSV} not found. Run `python compute_dv_shrinkage.py` first."
-    )
+    print(f"{_DV_SCALE_CSV.name} not found — running compute_dv_shrinkage.py...")
+    import subprocess, sys
+    _shrink_script = Path(__file__).resolve().parent / "compute_dv_shrinkage.py"
+    _r = subprocess.run([sys.executable, str(_shrink_script)],
+                        cwd=str(_shrink_script.parent), check=False)
+    if _r.returncode != 0 or not _DV_SCALE_CSV.exists():
+        raise FileNotFoundError(
+            f"{_DV_SCALE_CSV} still missing after compute_dv_shrinkage.py "
+            f"(exit={_r.returncode}). Mount the brainreg SSD and retry."
+        )
 DV_SCALE = pd.read_csv(_DV_SCALE_CSV).set_index("mouse")["scale_DV"].to_dict()
 
 log = pd.read_csv(RECORDING_LOG_URL)
@@ -262,7 +249,7 @@ log["track_file"] = log.apply(
 
 # Units: only audit tracks that actually have units recorded on them. Tracks
 # that exist as files but have no downstream consumers don't need checking.
-unit_props = pd.read_csv(p.LOGS_DIR / "RZ_unit_properties_with_qc.csv")
+unit_props = pd.read_csv(p.LOGS_DIR / "unit_properties_with_qc.csv")
 if "subject" in unit_props.columns:
     unit_props = unit_props.rename(columns={"subject": "mouse", "unit": "id",
                                             "session_datetime": "datetime"})
@@ -366,7 +353,6 @@ for mouse_dir in sorted(LOCAL_TRACKS_DIR.iterdir()):
             cp_dist_start_um=round(cp_dist_start_um, 1) if cp_in_sequence else np.nan,
             cp_dist_end_um=round(cp_dist_end_um, 1) if cp_in_sequence else np.nan,
             cp_length_um=round(cp_dist_end_um - cp_dist_start_um, 1) if cp_in_sequence else 0.0,
-            cp_miss_reason=diagnose_miss(cp_in_sequence, region_sequence, track_len),
             cov_cortex_um=round(_coverage["cortex"],   1),
             cov_wm_um=round(_coverage["WM/fiber"],     1),
             cov_str_cp_um=round(_coverage["STR/CP"],   1),
@@ -792,14 +778,5 @@ if len(_PROFILE_TRACKS):
 df_out.to_csv(OUT_CSV, index=False)
 print(f"\nSaved → {OUT_CSV}")
 print(f"  Passing tracks: {df_out['passes_audit'].sum()} / {len(df_out)}")
-
-# CP miss-reason distribution (for STR probes only).
-_str_miss = df_out[
-    df_out["track"].str.contains("_str", na=False)
-    & ~df_out["cp_in_sequence"]
-]
-if len(_str_miss):
-    print(f"\nSTR-probe CP miss reasons ({len(_str_miss)} tracks):")
-    print(_str_miss["cp_miss_reason"].value_counts().to_string())
 
 print(f"Plots saved to: {PLOT_DIR}")

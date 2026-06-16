@@ -6,15 +6,19 @@ processes events / trials / spikes per session. Saves one pickle per session
 to p.PICKLE_DIR plus a session log CSV.
 
 Inputs:
-  p.DATA_DIR / 'neural_data_0519.pkl'   - curated sessions list (from spike sorting)
-  Google Sheet recording log            - session metadata (region, etc.)
+  p.RAW_DATA_DIR / 'neural_data_0519.pkl'   - curated sessions list (from spike sorting)
+  Google Sheet recording log                - session metadata (region, etc.)
 
 Outputs:
   p.PICKLE_DIR / '{session_id}.pkl'         - per-session processed data
   p.LOGS_DIR / 'region_cell_count.csv'      - cells per mouse x region
   p.LOGS_DIR / 'sessions_official_raw.csv'  - master session log (no events/units)
+  p.DATA_DIR / 'sample_session/'            - CSV dump of one session (trials,
+                                              events, spikes) for column inspection
 
 Set REGENERATE = True to overwrite existing per-session pickles.
+Set SAMPLE_SESSION_ID to a specific session id (e.g. 'RZ050_2024-11-20_str')
+to dump that session's CSVs; if None, the first available pickle is used.
 """
 
 import os
@@ -29,6 +33,8 @@ import paths as p
 
 RAW_PICKLE_NAME = "neural_data_0519.pkl"
 REGENERATE = False
+SAMPLE_SESSION_ID = None        # None → first pickle found
+SAMPLE_SESSION_DIR = p.DATA_DIR / "sample_session"
 
 _RECORDING_LOG_SHEET_ID = "1xpb52EO7BII-_5zIcB2HaOpZqepFcYTvBYgxA4zLyNo"
 RECORDING_LOG_URL = (
@@ -292,10 +298,93 @@ def process_and_save_all_sessions(curated_sessions, pickle_dir, regenerate):
         print(f"Saved session {session['id']} to {output_path}")
 
 
+# ── 7. Sample-session CSV dump ────────────────────────────────────────────────
+
+def save_sample_session_csvs(pickle_dir, out_dir, session_id=None,
+                              n_sample_units=3, save_all_units=False):
+    """Load one processed-session pickle and dump trials/events/spikes as CSVs.
+
+    Useful for inspecting the column layout and example values without having
+    to unpickle in a notebook.
+
+    Spikes are concatenated across units with a `unit_id` column. By default
+    only the first `n_sample_units` units are written to `sample_spikes.csv`
+    (kept small so the file opens quickly). Pass `save_all_units=True` to
+    additionally write `sample_spikes_all_units.csv` with every unit.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if session_id is None:
+        candidates = sorted(pickle_dir.glob("*.pkl"))
+        if not candidates:
+            print(f"  [sample] no pickles in {pickle_dir} — skipping CSV dump.")
+            return
+        pickle_path = candidates[0]
+        session_id = pickle_path.stem
+    else:
+        pickle_path = pickle_dir / f"{session_id}.pkl"
+        if not pickle_path.exists():
+            print(f"  [sample] {pickle_path} not found — skipping CSV dump.")
+            return
+
+    with open(pickle_path, "rb") as f:
+        sess = pickle.load(f)
+
+    trials = sess["trials"]
+    events = sess["events"]
+    units  = sess["units"]
+
+    def _concat_units(items):
+        rows = []
+        for uid, spk_df in items:
+            if spk_df is None or spk_df.empty:
+                continue
+            spk = spk_df.copy()
+            spk.insert(0, "unit_id", uid)
+            rows.append(spk)
+        return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+    unit_items = list(units.items())
+    sample_units = unit_items[:n_sample_units]
+    spikes_sample = _concat_units(sample_units)
+
+    trials.to_csv(out_dir / "sample_trials.csv", index=False)
+    events.to_csv(out_dir / "sample_events.csv", index=False)
+    spikes_sample.to_csv(out_dir / "sample_spikes.csv", index=False)
+
+    if save_all_units:
+        spikes_all = _concat_units(unit_items)
+        spikes_all.to_csv(out_dir / "sample_spikes_all_units.csv", index=False)
+
+    info_lines = [
+        f"source_pickle: {pickle_path}",
+        f"id:     {sess.get('id', session_id)}",
+        f"mouse:  {sess.get('mouse', '')}",
+        f"date:   {sess.get('date', '')}",
+        f"region: {sess.get('region', '')}",
+        f"n_units_total:    {len(units)}",
+        f"n_units_in_csv:   {len(sample_units)}",
+        f"sample_unit_ids:  {[uid for uid, _ in sample_units]}",
+        f"n_trials:         {len(trials)}",
+        f"n_events:         {len(events)}",
+        f"n_spikes_in_csv:  {len(spikes_sample)}",
+    ]
+    info_path = out_dir / "sample_info.txt"
+    info_path.write_text("\n".join(info_lines) + "\n")
+
+    print(f"\n  [sample] {session_id}")
+    print(f"    trials  → {out_dir / 'sample_trials.csv'}  ({len(trials)} rows, {trials.shape[1]} cols)")
+    print(f"    events  → {out_dir / 'sample_events.csv'}  ({len(events)} rows, {events.shape[1]} cols)")
+    print(f"    spikes  → {out_dir / 'sample_spikes.csv'}  ({len(spikes_sample)} rows, {spikes_sample.shape[1]} cols; first {len(sample_units)} units)")
+    if save_all_units:
+        print(f"    spikes (all units) → {out_dir / 'sample_spikes_all_units.csv'}")
+    print(f"    info    → {info_path}")
+
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 print("Loading curated sessions pickle...")
-with open(p.DATA_DIR / RAW_PICKLE_NAME, "rb") as f:
+with open(p.RAW_DATA_DIR / RAW_PICKLE_NAME, "rb") as f:
     curated_sessions_list = pickle.load(f)
 
 curated_sessions_all = generate_sessions_sorted(curated_sessions_list)
@@ -333,5 +422,8 @@ process_and_save_all_sessions(curated_sessions, p.PICKLE_DIR, REGENERATE)
 print("\nWriting session log...")
 sorted_sessions = curated_sessions.drop(columns=["events", "units", "unit_ids"])
 sorted_sessions.to_csv(p.LOGS_DIR / "sessions_official_raw.csv")
+
+print("\nDumping sample-session CSVs...")
+save_sample_session_csvs(p.PICKLE_DIR, SAMPLE_SESSION_DIR, SAMPLE_SESSION_ID)
 
 print("\nDone.")

@@ -34,16 +34,18 @@ Output columns:
   region_group       broad bucket (Striatum, Motor cortex, Visual cortex, …)
 
 Inputs:
-  RZ_unit_properties_with_qc_and_regions.csv     (output of 0f, atlas-only)
+  unit_properties_with_qc_and_regions.csv     (output of 0f, atlas-only)
   data/location_matching/diagnostic/
       flagged_units_gpe_boundary.csv             (0g — drives R1)
       ccb_units.csv                              (0g — cross-checked by R4)
       probe_context_check.csv                    (0g — informational)
 
 Outputs:
-  RZ_unit_properties_final.csv  (canonical post-correction)
-  RZ_str_units.csv  RZ_str_msn.csv  RZ_str_fsi.csv
-  RZ_cortex_units.csv  RZ_v1_cortical.csv
+  unit_properties_final.csv  (canonical post-correction; downstream loaders
+                              read this file and slice rows via boolean
+                              membership columns: is_str_unit, is_str_msn,
+                              is_cortex, is_v1_cortical, is_mc_l5l6;
+                              0i adds is_msn_depth + is_msn_depth_permissive)
   relabeling_summary.csv
 
   Then 0g is re-run against the corrected labels to produce a "post-relabel"
@@ -58,6 +60,7 @@ Plots (in DATA_DIR/location_matching/cell_type/):
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -103,7 +106,14 @@ THAL_REGIONS = {
     "IAD", "RE", "VM", "CM", "ATN", "ILM", "PIL", "SPF", "MG",
     "LGd", "LGv", "PCN", "VL", "SGN", "TH"
 }
-HPC_REGIONS = {"CA1", "CA2", "CA3", "SUB", "ProS", "DG", "HIP", "HPF"}
+HPC_REGIONS = {"CA1", "CA2", "CA3", "SUB", "ProS", "DG", "HIP", "HPF",
+               "DG-mo", "DG-po", "DG-sg", "PRE", "POST"}
+
+# Per-nucleus thalamic + hippocampal subsets for the region-comparison panel.
+VAL_REGIONS = {"VAL"}
+PO_REGIONS  = {"PO", "POL"}
+VPM_REGIONS = {"VPM", "VPMpc"}
+CA1_REGIONS = {"CA1"}
 FIBER_TRACT_REGIONS = {
     "ccb", "ccs", "ccg", "fi", "dhc", "ec", "st", "cing",
     "fp", "or", "scwm", "int", "root", "fiber_tract",
@@ -171,8 +181,8 @@ print("=" * 70)
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 csv_candidates = [
-    p.LOGS_DIR / "RZ_unit_properties_with_qc_and_regions.csv",
-    p.LOGS_DIR / "RZ_unit_properties_with_regions.csv",
+    p.LOGS_DIR / "unit_properties_with_qc_and_regions.csv",
+    p.LOGS_DIR / "unit_properties_with_regions.csv",
 ]
 csv_path = next((c for c in csv_candidates if c.exists()), None)
 if csv_path is None:
@@ -520,29 +530,47 @@ df["region_group"] = df["corrected_region"].apply(get_region_group)
 in_cortex_region = df["region_group"].isin({"Motor cortex", "Visual cortex"})
 in_visual_cortex = df["region_group"] == "Visual cortex"
 
-# STR units: corrected_region in STR_REGIONS (atlas + recovered)
-str_mask  = df["corrected_region"].isin(STR_REGIONS)
-str_units = df[str_mask].copy()
-print(f"\n  STR units (corrected_region ∈ STR_REGIONS): {len(str_units)}")
-
-str_msn = df[str_mask & is_msn].copy()
-print(f"  STR MSN: {len(str_msn)}")
-
-str_fsi = df[str_mask & is_fsi].copy()
-print(f"  STR FSI: {len(str_fsi)}")
-
-str_tan = df[str_mask & is_tan].copy()
-print(f"  STR TAN: {len(str_tan)}")
-
-# Cortical units: corrected_region in a motor/visual cortex label
-cortex_mask  = in_cortex_region & (df["corrected_region"] != "unplaceable")
-cortex_units = df[cortex_mask].copy()
-print(f"  Cortical units (region_group ∈ {{Motor, Visual cortex}}): {len(cortex_units)}")
-
-# V1 cortical: visual cortex on V1 probe
+# Cell-set membership masks → tagged as boolean columns on the canonical CSV.
+# Downstream loaders (rescaling, population_decoder) slice rows via these
+# columns instead of loading per-set CSVs.
+str_mask         = df["corrected_region"].isin(STR_REGIONS)
+cortex_mask      = in_cortex_region & (df["corrected_region"] != "unplaceable")
 v1_cortical_mask = v1_probe_mask & in_visual_cortex
-v1_cortical      = df[v1_cortical_mask].copy()
-print(f"  V1 cortical (V1 probe + Visual cortex): {len(v1_cortical)}")
+
+# Motor cortex L5/L6 (MOp/MOs only — excludes SSp). Population decoder input.
+MC_L5L6_TAGS = {"MOp5", "MOs5", "MOp6a", "MOp6b", "MOs6a", "MOs6b"}
+mc_l5l6_mask = (df["region_group"] == "Motor cortex") & df["corrected_region"].isin(MC_L5L6_TAGS)
+
+df["is_str_unit"]    = str_mask
+df["is_str_msn"]     = str_mask & is_msn
+df["is_cortex"]      = cortex_mask
+df["is_v1_cortical"] = v1_cortical_mask
+df["is_mc_l5l6"]     = mc_l5l6_mask
+
+# Region-comparison panel: per-nucleus thalamic flags + visual cortex (probe-agnostic)
+# + hippocampal subsets. Used by rescaling and population_decoder.
+df["is_thal"] = df["corrected_region"].isin(THAL_REGIONS)
+df["is_val"]  = df["corrected_region"].isin(VAL_REGIONS)
+df["is_po"]   = df["corrected_region"].isin(PO_REGIONS)
+df["is_vpm"]  = df["corrected_region"].isin(VPM_REGIONS)
+df["is_visp"] = df["region_group"] == "Visual cortex"
+df["is_ca1"]  = df["corrected_region"].isin(CA1_REGIONS)
+df["is_hpf"]  = df["corrected_region"].isin(HPC_REGIONS)
+
+print(f"\n  STR units (corrected_region ∈ STR_REGIONS): {int(df['is_str_unit'].sum())}")
+print(f"  STR MSN:      {int(df['is_str_msn'].sum())}")
+print(f"  STR FSI:      {int((str_mask & is_fsi).sum())}")
+print(f"  STR TAN:      {int((str_mask & is_tan).sum())}")
+print(f"  Cortical (Motor/Visual cortex):                    {int(df['is_cortex'].sum())}")
+print(f"  V1 cortical (V1 probe + Visual cortex):            {int(df['is_v1_cortical'].sum())}")
+print(f"  MC L5/L6 (MOp/MOs, layers 5–6):                    {int(df['is_mc_l5l6'].sum())}")
+print(f"  Thalamus (all THAL_REGIONS):                       {int(df['is_thal'].sum())}")
+print(f"    VAL:    {int(df['is_val'].sum())}")
+print(f"    PO:     {int(df['is_po'].sum())}")
+print(f"    VPM:    {int(df['is_vpm'].sum())}")
+print(f"  Visual cortex (probe-agnostic):                    {int(df['is_visp'].sum())}")
+print(f"  CA1:                                               {int(df['is_ca1'].sum())}")
+print(f"  HPF umbrella (CA1/CA3/DG/ProS/SUB/...):            {int(df['is_hpf'].sum())}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -563,6 +591,16 @@ crosstab_str = pd.crosstab(str_probe_df["corrected_region"], str_probe_df["cell_
 print("\n  STR probe detailed (region × cell type):")
 print(crosstab_str.to_string())
 
+# Region × BG group breakdown (post-correction)
+_short_mice = set(c.GROUP_DICT["s"])
+_long_mice  = set(c.GROUP_DICT["l"])
+df["bg_group"] = df["mouse"].apply(
+    lambda m: "Short BG" if m in _short_mice else ("Long BG" if m in _long_mice else "Unassigned")
+)
+crosstab_region_bg = pd.crosstab(df["region_group"], df["bg_group"], margins=True)
+print("\n  Region × BG group (corrected):")
+print(crosstab_region_bg.to_string())
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SAVE OUTPUTS
@@ -578,17 +616,10 @@ print("-" * 70)
 df["region_acronym_atlas"] = df["region_acronym"]
 df["region_acronym"]       = df["corrected_region"]
 
-df.to_csv(p.LOGS_DIR / "RZ_unit_properties_final.csv", index=False)
-str_units.to_csv(p.LOGS_DIR    / "RZ_str_units.csv",    index=False)
-str_msn.to_csv(p.LOGS_DIR      / "RZ_str_msn.csv",      index=False)
-str_fsi.to_csv(p.LOGS_DIR      / "RZ_str_fsi.csv",      index=False)
-cortex_units.to_csv(p.LOGS_DIR / "RZ_cortex_units.csv", index=False)
-v1_cortical.to_csv(p.LOGS_DIR  / "RZ_v1_cortical.csv",  index=False)
+df.to_csv(p.LOGS_DIR / "unit_properties_final.csv", index=False)
 crosstab.reset_index().to_csv(PLOT_DIR / "relabeling_summary.csv", index=False)
 
-print(f"  RZ_unit_properties_final.csv  ({len(df)} units, all columns)")
-print(f"  RZ_str_units.csv              ({len(str_units)} units)  ← all CP/STR units (rescaling input)")
-print(f"  RZ_str_msn.csv  RZ_str_fsi.csv  RZ_cortex_units.csv  RZ_v1_cortical.csv")
+print(f"  unit_properties_final.csv  ({len(df)} units, all columns + is_* membership flags)")
 print(f"  relabeling_summary.csv        ({PLOT_DIR.name}/)")
 
 
@@ -607,10 +638,11 @@ print("=" * 70)
 
 # Use date_only when present for readability; fall back to datetime.
 _session_keys = (["mouse", "date_only", "insertion_number"]
-                 if "date_only" in str_msn.columns
+                 if "date_only" in df.columns
                  else ["mouse", "datetime", "insertion_number"])
 msn_per_session = (
-    str_msn.groupby(_session_keys)["id"].nunique().reset_index(name="n_msn")
+    df[df["is_str_msn"]]
+      .groupby(_session_keys)["id"].nunique().reset_index(name="n_msn")
 )
 msn_per_session["bg_group"] = msn_per_session["mouse"].apply(
     lambda m: "Short BG" if m in SHORT_MICE else ("Long BG" if m in LONG_MICE else "Unassigned")
@@ -624,48 +656,9 @@ print(f"  Sessions meeting threshold: {n_qualify_total}  "
       f"({100*n_qualify_total/n_sessions:.0f}%)" if n_sessions else
       "  No sessions with STR MSN units.")
 
-if n_sessions:
-    # ── Per-BG-group summary ──────────────────────────────────────────────────
-    print(f"\n  {'BG group':<12} {'sessions':>8} {'qualify':>8} {'median':>7} {'max':>5}")
-    for group in ("Short BG", "Long BG", "Unassigned"):
-        sub = msn_per_session[msn_per_session["bg_group"] == group]
-        if len(sub) == 0:
-            continue
-        n_q = int(sub["meets_threshold"].sum())
-        print(f"  {group:<12} {len(sub):>8} {n_q:>8} "
-              f"{sub['n_msn'].median():>7.0f} {sub['n_msn'].max():>5}")
-
-    # ── Per-mouse summary ─────────────────────────────────────────────────────
-    print("\n  Per-mouse summary:")
-    per_mouse = (msn_per_session.groupby("mouse")
-                 .agg(n_sessions=(_session_keys[1], "count"),
-                      n_qualifying=("meets_threshold", "sum"),
-                      median_msn=("n_msn", "median"),
-                      max_msn=("n_msn", "max"))
-                 .astype({"n_qualifying": int}))
-    print(per_mouse.to_string())
-
-    # ── Qualifying sessions (the downstream-facing answer) ────────────────────
-    qualifying = msn_per_session[msn_per_session["meets_threshold"]].sort_values(
-        ["mouse"] + _session_keys[1:]
-    )
-    print(f"\n  Sessions meeting the gate ({len(qualifying)}):")
-    print(qualifying.to_string(index=False))
-
-    # ── Below-gate sessions (top 20 by n_msn — closest to qualifying) ─────────
-    below = msn_per_session[~msn_per_session["meets_threshold"]].sort_values(
-        "n_msn", ascending=False
-    )
-    if len(below):
-        print(f"\n  Sessions BELOW the gate (top 20 by n_msn):")
-        print(below.head(20).to_string(index=False))
-
 # ── Save the per-session table for downstream consumption ─────────────────────
 session_decoder_path = PLOT_DIR / "session_msn_decoder_eligibility.csv"
 msn_per_session.to_csv(session_decoder_path, index=False)
-print(f"\n  Saved → {session_decoder_path}")
-print(f"\n  Note: population_decoder.py also gates on >150 valid trials/session;")
-print(f"  final session count after that gate may be lower than {n_qualify_total}.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1070,16 +1063,16 @@ print(f"  Snapshotted pre-relabel flags → {PRE_RELABEL_DIR}")
 # 2. Promote corrected labels into the canonical CSV that 0g reads. df was
 #    already mutated above (region_acronym_atlas + region_acronym=corrected),
 #    so we just save it back to the path 0g expects.
-CANONICAL_CSV = p.LOGS_DIR / "RZ_unit_properties_with_qc_and_regions.csv"
+CANONICAL_CSV = p.LOGS_DIR / "unit_properties_with_qc_and_regions.csv"
 df.to_csv(CANONICAL_CSV, index=False)
 print(f"  Wrote corrected labels → {CANONICAL_CSV.name}")
 
 # 3. Subprocess-run 0g. Streaming output to our stdout for visibility.
 G_SCRIPT = Path(__file__).resolve().parent / "0g_waveform_diagnostic.py"
-print(f"  Invoking: python {G_SCRIPT.name}")
+print(f"  Invoking: {sys.executable} {G_SCRIPT.name}")
 print("-" * 70)
 _result = subprocess.run(
-    ["python", str(G_SCRIPT)],
+    [sys.executable, str(G_SCRIPT)],
     cwd=str(G_SCRIPT.parent),
     check=False,
 )
